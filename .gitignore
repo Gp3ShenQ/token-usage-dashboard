@@ -1,0 +1,12 @@
+node_modules
+dist
+dist-electron
+release
+data
+.agents/
+.codebase-memory/
+.codex/
+.env
+.env.*
+!.env.example
+*.log
