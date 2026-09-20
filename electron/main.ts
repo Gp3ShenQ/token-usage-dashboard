@@ -1,8 +1,10 @@
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
+import { queueCodexHandoff } from "./codex-queue.js";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, Notification, screen } from "electron";
+import { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, Notification, screen, clipboard } from "electron";
 import { bootstrapServer } from "../server/index.js";
 import { UsageDatabase } from "../server/db/database.js";
 import { formatTokenCompact } from "../server/utils.js";
@@ -24,7 +26,10 @@ let overlaysPaused = false;
 let lastSummaryTotal = 0;
 const overlayWindows = new Map<string, BrowserWindow>();
 const OVERLAY_WIDTH = 208;
-const OVERLAY_HEIGHT = 352;
+const OVERLAY_HEIGHT = 448;
+const handoffToken = randomUUID();
+// Leave room for reception instructions alongside a report of up to 256 KiB.
+const HANDOFF_CLIPBOARD_LIMIT = 512 * 1024;
 const OVERLAY_MARGIN = 12;
 const OVERLAY_TOP_OFFSET = 25;
 
@@ -45,6 +50,7 @@ function getRendererTarget(page: "dashboard" | "widget", params?: Record<string,
     ? `${devServerUrl}/${page === "dashboard" ? "" : "widget.html"}`
     : pathToFileURL(path.join(app.getAppPath(), "dist", page === "dashboard" ? "index.html" : "widget.html")).toString();
   const url = new URL(base);
+  if (page === "widget") url.searchParams.set("handoffToken", handoffToken);
 
   for (const [key, value] of Object.entries(params ?? {})) {
     url.searchParams.set(key, value);
@@ -190,7 +196,7 @@ async function createOverlayWindow(target: DetectedTerminalWindow, shouldShow: b
 
   win.setAlwaysOnTop(true, "screen-saver");
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-  win.setIgnoreMouseEvents(true);
+  win.setIgnoreMouseEvents(true, { forward: true });
   win.once("ready-to-show", () => {
     if (shouldShow && !overlaysPaused) {
       win.showInactive();
@@ -378,6 +384,19 @@ function launchAgentTerminal(agent: AgentKind) {
 }
 
 function setupIpc() {
+  ipcMain.on("widget:pointer", (event, interactive: unknown) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (win && [...overlayWindows.values()].includes(win)) {
+      win.setIgnoreMouseEvents(interactive !== true, { forward: true });
+    }
+  });
+  ipcMain.handle("handoff:copy", (event, text: unknown) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win || (win !== widgetWindow && ![...overlayWindows.values()].includes(win)) ||
+        typeof text !== "string" || text.length > HANDOFF_CLIPBOARD_LIMIT) throw new Error("無法複製交接指令。");
+    clipboard.writeText(text);
+    return { ok: true };
+  });
   ipcMain.handle("widget:get-settings", async () => ({
     opacity: Number(settingsDb?.getSetting("widget.opacity") ?? 0.82),
     refreshSeconds: Number(settingsDb?.getSetting("widget.refreshSeconds") ?? 60),
@@ -453,28 +472,9 @@ function startOverlayWatcher() {
 
 async function main() {
   writeStartupLog("main start");
-  try {
-    const preloadJsPath = path.join(__dirname, "preload.js");
-    const preloadCjsPath = path.join(__dirname, "preload.cjs");
-    writeStartupLog("__dirname: " + __dirname);
-    writeStartupLog("preloadJsPath: " + preloadJsPath);
-    writeStartupLog("preloadJsPath exists: " + fs.existsSync(preloadJsPath));
-    if (fs.existsSync(preloadJsPath)) {
-      let content = fs.readFileSync(preloadJsPath, "utf-8");
-      content = content.replace(
-        /import\s*\{\s*contextBridge\s*,\s*ipcRenderer\s*\}\s*from\s*["']electron["']/g,
-        'const { contextBridge, ipcRenderer } = require("electron")'
-      );
-      fs.writeFileSync(preloadCjsPath, content, "utf-8");
-      writeStartupLog("preload.cjs generated successfully");
-      writeStartupLog("preloadCjsPath exists: " + fs.existsSync(preloadCjsPath));
-    }
-  } catch (e) {
-    writeStartupLog("failed to generate preload.cjs", e);
-  }
   settingsDb = new UsageDatabase();
   writeStartupLog("settings database ready");
-  backend = await bootstrapServer();
+  backend = await bootstrapServer({ root: path.join(app.getPath("userData"), "handoffs"), token: handoffToken, dispatch: queueCodexHandoff });
   writeStartupLog("backend ready");
   backend.monitor.onComplete((snapshot) => {
     const title = (snapshot.source === "claude" ? "Claude" : "Codex") + " 本輪回覆已結束";

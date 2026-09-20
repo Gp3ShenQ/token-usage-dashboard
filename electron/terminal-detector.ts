@@ -249,7 +249,7 @@ export async function detectTerminalWindowSnapshot(): Promise<TerminalWindowSnap
           ...window,
           id: `${window.hwnd}-${titleSession.agent}`,
           agent: titleSession.agent,
-          sessionPrefix: binding?.sessionId.slice(0, 8).toLowerCase() ?? titleSession.sessionPrefix,
+          sessionPrefix: binding?.sessionId.toLowerCase() ?? titleSession.sessionPrefix,
           taskLabel: titleSession.taskLabel,
         };
 

@@ -24,6 +24,7 @@
   },
   "include": [
     "electron/**/*.ts",
+    "electron/**/*.cts",
     "server/**/*.ts"
   ]
 }
