@@ -45,6 +45,77 @@ const eventAge = computed(() => formatEventAge(monitor.value?.sourceUpdatedAt, n
 const healthText = computed(() => !live.value ? "即時連線中斷" : monitor.value?.readError ? "紀錄讀取異常" : quotaError.value ? "額度更新失敗" : "監測連線正常");
 const tokensText = (value: number | null | undefined) => value == null ? "—" : formatTokenCompact(value);
 
+const handoff = ref<import("../../server/monitor/handoff").HandoffStatus | null>(null);
+const handoffBusy = ref(false);
+const handoffNotice = ref("");
+let handoffTimer: number | null = null;
+let handoffLoading = false;
+const isExactSession = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sessionPrefix);
+const canHandoff = computed(() => isExactSession && live.value && !!monitor.value?.cwd &&
+  monitor.value.sessionId === sessionPrefix && !monitor.value.readError && !!window.tokenHud?.copyHandoffText);
+const handoffLabel = computed(() => {
+  if (handoffBusy.value) return "處理中…";
+  if (handoff.value?.phase === "ready") return "複製接手指令";
+  if (handoff.value?.phase === "manual" || handoff.value?.phase === "failed") return "複製交接指令";
+  if (handoff.value && ["waiting", "sending", "queued"].includes(handoff.value.phase)) return "等待交接報告";
+  return currentAgent.value === "codex" ? "產生交接報告" : "複製交接指令";
+});
+const handoffDisabled = computed(() => handoffBusy.value || (!canHandoff.value && handoff.value?.phase !== "ready") ||
+  (!!handoff.value && ["waiting", "sending", "queued"].includes(handoff.value.phase)));
+const handoffMessage = computed(() => handoffNotice.value || handoff.value?.message ||
+  (!isExactSession ? "需要完整 session 綁定" : !canHandoff.value ? "等待 session 與工作目錄確認" :
+    currentAgent.value === "claude" ? "貼到原 AI，由它整理交接" : "原 AI 完成本輪後整理交接"));
+
+async function loadHandoffStatus() {
+  if (!isExactSession || handoffLoading || handoffBusy.value) return;
+  handoffLoading = true;
+  try {
+    const result = await api.handoff<import("../../server/monitor/handoff").HandoffStatus | null>(currentAgent.value, sessionPrefix, "status");
+    if (!disposed) {
+      if (result?.phase !== handoff.value?.phase) handoffNotice.value = "";
+      handoff.value = result;
+    }
+  } catch (error) {
+    if (!disposed) handoffNotice.value = error instanceof Error ? error.message : "無法確認交接狀態。";
+  } finally { handoffLoading = false; }
+}
+
+async function handleCopyHandoffReport() {
+  if (handoffBusy.value || handoff.value?.phase !== "ready") return;
+  handoffBusy.value = true;
+  handoffNotice.value = "";
+  try {
+    const content = await api.handoff<string>(currentAgent.value, sessionPrefix, "content");
+    if (!window.tokenHud) throw new Error("剪貼簿橋接未就緒。");
+    await window.tokenHud.copyHandoffText(content);
+    handoffNotice.value = "已複製報告內容，可直接貼上";
+  } catch (error) {
+    handoffNotice.value = error instanceof Error ? error.message : "無法複製報告內容。";
+  } finally { handoffBusy.value = false; }
+}
+
+async function handleHandoff() {
+  if (handoffDisabled.value) return;
+  handoffBusy.value = true;
+  handoffNotice.value = "";
+  try {
+    if (!handoff.value || handoff.value.phase === "removed") {
+      handoff.value = await api.handoff(currentAgent.value, sessionPrefix, "prepare",
+        currentAgent.value === "codex" ? "queue" : "manual");
+    }
+    if (handoff.value && ["manual", "ready", "failed"].includes(handoff.value.phase)) {
+      const receiving = handoff.value.phase === "ready";
+      const prompt = await api.handoff<string>(currentAgent.value, sessionPrefix, receiving ? "receive" : "generate");
+      if (!window.tokenHud) throw new Error("剪貼簿橋接未就緒。");
+      await window.tokenHud.copyHandoffText(prompt);
+      handoffNotice.value = receiving ? "已複製；到同工作目錄的新 AI 貼上" :
+        "已複製；先確認原 AI 未收到，再貼上";
+    }
+  } catch (error) {
+    handoffNotice.value = error instanceof Error ? error.message : "交接操作失敗。";
+  } finally { handoffBusy.value = false; }
+}
+
 function connectMonitor() {
   if (!sessionPrefix) return;
   stream = api.monitorStream(currentAgent.value, sessionPrefix);
@@ -129,6 +200,10 @@ async function resetTimers() {
 
 onMounted(async () => {
   connectMonitor();
+  if (isOverlay) {
+    void loadHandoffStatus();
+    handoffTimer = window.setInterval(() => void loadHandoffStatus(), 2000);
+  }
   clockTimer = window.setInterval(() => { now.value = Date.now(); }, 1000);
   const saved = await window.tokenHud?.getWidgetSettings().catch(() => undefined);
   if (disposed) return;
@@ -144,6 +219,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   disposed = true;
   stream?.close();
+  if (handoffTimer) window.clearInterval(handoffTimer);
   if (clockTimer) window.clearInterval(clockTimer);
   if (refreshTimer) {
     window.clearInterval(refreshTimer);
@@ -230,6 +306,11 @@ onBeforeUnmount(() => {
         <div class="session-row" :title="'累積 token：' + (monitor?.sessionTokens ?? '未知')"><span>Session tokens</span><strong>{{ tokensText(monitor?.sessionTokens) }}</strong></div>
         <div class="session-row" :title="'本輪 token：' + (monitor?.turnTokens ?? '未知')"><span>本輪增加</span><strong>{{ tokensText(monitor?.turnTokens) }}</strong></div>
         <div class="session-health"><span>{{ healthText }}</span><span>事件 {{ eventAge }}</span></div>
+        <div v-if="isOverlay" class="handoff-controls" data-handoff-controls>
+          <button type="button" class="handoff-button" :disabled="handoffDisabled" @click="handleHandoff">{{ handoffLabel }}</button>
+          <button type="button" class="handoff-button handoff-copy-report" :disabled="handoffBusy || handoff?.phase !== 'ready'" @click="handleCopyHandoffReport">複製交接報告內容</button>
+          <span class="handoff-message" role="status" :title="handoffMessage">{{ handoffMessage }}</span>
+        </div>
       </section>
 
       <footer v-if="!isOverlay" class="micro-controls">
@@ -253,4 +334,11 @@ onBeforeUnmount(() => {
 .session-row > span { color: var(--muted); }
 .session-row strong { font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .session-health { border-top: 1px solid rgba(88, 74, 56, 0.12); padding-top: 6px; font-size: 9px; color: var(--muted); }
+
+.handoff-controls { display: grid; gap: 4px; min-width: 0; -webkit-app-region: no-drag; }
+.handoff-button { width: 100%; min-height: 27px; padding: 4px 7px; font: inherit; font-size: 11px; border: 1px solid rgba(88, 74, 56, 0.2); border-radius: 6px; color: var(--text); background: rgba(255, 255, 255, 0.65); cursor: pointer; }
+.handoff-button:hover:not(:disabled) { background: rgba(138, 162, 157, 0.25); }
+.handoff-button:focus-visible { outline: 2px solid #718983; outline-offset: 2px; }
+.handoff-button:disabled { opacity: 0.55; cursor: default; }
+.handoff-message { font-size: 9px; line-height: 1.4; color: var(--muted); overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 </style>

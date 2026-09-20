@@ -3,6 +3,7 @@
 declare global {
   interface Window {
     tokenHud?: {
+      copyHandoffText: (text: string) => Promise<{ ok: true }>;
       getWidgetSettings: () => Promise<{ opacity: number; refreshSeconds: number }>;
       saveWidgetSettings: (payload: Record<string, number | string>) => Promise<{ ok: true }>;
       openDashboard: () => Promise<{ ok: true }>;

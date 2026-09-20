@@ -89,6 +89,16 @@ export type SessionContextResponse =
   | { state: "pending" | "ambiguous" };
 
 export const api = {
+  async handoff<T>(source: "claude" | "codex", sessionId: string, action: "status" | "prepare" | "generate" | "receive" | "content", mode?: "queue" | "manual"): Promise<T> {
+    const response = await fetch(API_BASE + "/api/handoff", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-token-hud": new URLSearchParams(location.search).get("handoffToken") ?? "" },
+      body: JSON.stringify({ source, sessionId, action, mode }),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) throw new Error(result.error ?? "交接操作失敗。");
+    return result.data;
+  },
   monitorStream: (source: "claude" | "codex", session: string) =>
     new EventSource(`${API_BASE}/api/monitor/stream?${new URLSearchParams({ source, session })}`),
   sessions: (from: string, to: string, signal?: AbortSignal) =>
