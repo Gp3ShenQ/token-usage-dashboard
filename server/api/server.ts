@@ -1,3 +1,4 @@
+import { registerHandoffRoutes, type HandoffService } from "../monitor/handoff.js";
 import { registerMonitorRoutes } from "../monitor/routes.js";
 import type { SessionMonitorService } from "../monitor/service.js";
 import Fastify from "fastify";
@@ -252,10 +253,11 @@ function isSessionDateRange(from: string, to: string) {
   return isDate(from) && isDate(to) && from <= to;
 }
 
-export async function createApiServer(db: UsageDatabase, scanner: UsageScanner, monitor?: SessionMonitorService) {
+export async function createApiServer(db: UsageDatabase, scanner: UsageScanner, monitor?: SessionMonitorService, handoff?: { service: HandoffService; token: string }) {
   const app = Fastify({ logger: false });
   await app.register(cors, { origin: true });
   if (monitor) registerMonitorRoutes(app, monitor);
+  if (handoff) registerHandoffRoutes(app, handoff.service, handoff.token);
 
   app.get<{ Querystring: { from?: string; to?: string } }>("/api/sessions", async (request, reply) => {
     const { from = "", to = "" } = request.query;

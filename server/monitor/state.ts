@@ -3,6 +3,7 @@ export type RunStatus = "unknown" | "running" | "waiting_input" | "waiting_appro
 export type MonitorSnapshot = {
   source: AgentSource;
   sessionId: string;
+  cwd?: string;
   status: RunStatus;
   statusAt: string | null;
   turnId: string | null;
@@ -44,6 +45,7 @@ export class SessionMonitorState {
   private codexTotal = 0;
   private codexBaseline = 0;
   private hookIds = new Set<string>();
+  private cwdAt = "";
   private modelAt = "";
   private effortAt = "";
   private contextAt = "";
@@ -189,6 +191,12 @@ export class SessionMonitorState {
     if (!record || typeof record !== "object") return;
     const timestamp = this.timestamp(record.timestamp);
     if (!timestamp) return;
+    const cwd = this.data.source === "claude" ? (!record.isSidechain ? record.cwd : null) :
+      ["session_meta", "turn_context"].includes(record.type) ? record.payload?.cwd : null;
+    if (typeof cwd === "string" && cwd.trim() && timestamp >= this.cwdAt) {
+      this.data.cwd = cwd;
+      this.cwdAt = timestamp;
+    }
     if (this.data.source === "claude") {
       const message = record.message;
       const content = message?.content;
