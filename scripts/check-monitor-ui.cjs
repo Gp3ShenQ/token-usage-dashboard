@@ -38,6 +38,15 @@ const waitForText = async (selector, expected) => window.webContents.executeJava
     check();
   })`);
 function check(name, condition) { if (!condition) throw new Error(name); results.push(name); }
+async function checkHandoffThreshold() {
+  for (const percent of [null, 43.2, 72, 72.1, 72, 73]) {
+    data.contextPercent = percent;
+    push();
+    await waitForText(".session-context strong", percent == null ? "—" : percent.toFixed(1) + "%");
+    const buttonCount = await window.webContents.executeJavaScript('document.querySelectorAll(".handoff-controls button").length');
+    check(`${data.source} handoff visibility at Context ${percent}`, buttonCount === (percent > 72 ? 2 : 0));
+  }
+}
 async function finish(error) {
   fs.writeFileSync(path.join(output, "result.json"), JSON.stringify({ appRoot, packaged: process.argv.includes("--packaged"), passed: results, error: error?.stack ?? null }, null, 2));
   if (window && !window.isDestroyed()) window.destroy();
@@ -99,6 +108,7 @@ app.whenReady().then(async () => {
   await waitForText(".task-label-value", "相容驗證");
   check("Claude model and effort are visible", await window.webContents.executeJavaScript('document.querySelector(".session-model").textContent.includes("Claude Opus 4.6") && document.querySelector(".session-model").textContent.includes("high")'));
   check("all metrics fit within the fixed overlay", await window.webContents.executeJavaScript('document.querySelector(".session-health").getBoundingClientRect().bottom <= innerHeight && document.documentElement.scrollWidth <= innerWidth'));
+  await checkHandoffThreshold();
   await waitForText(".handoff-button", "複製交接指令");
   check("report copy is disabled until ready", await window.webContents.executeJavaScript('document.querySelector(".handoff-copy-report").disabled'));
   await window.webContents.executeJavaScript('document.querySelector(".handoff-button").click()');
@@ -138,6 +148,7 @@ app.whenReady().then(async () => {
   await waitForText(".task-label-value", "相容驗證");
   check("Codex context is labeled approximate", await window.webContents.executeJavaScript('document.querySelector(".session-context").textContent.includes("≈")'));
   check("long model fits without horizontal overflow", await window.webContents.executeJavaScript('Array.from(document.querySelectorAll(".single-agent-card, .session-status, .session-health, .session-row strong")).every(element => element.getBoundingClientRect().right <= innerWidth)'));
+  await checkHandoffThreshold();
   await waitForText(".handoff-button", "產生交接報告");
   await window.webContents.executeJavaScript('document.querySelector(".handoff-button").click()');
   await waitForText(".handoff-button", "等待交接報告");
