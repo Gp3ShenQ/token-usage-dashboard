@@ -198,7 +198,8 @@ it("copies reception instructions and the complete report through the protected 
   const copiedText: string = response.json().data;
   const metadata = JSON.parse(copiedText.split("\n")[1]);
   expect(metadata).toEqual({ path: job.reportPath, handoffId: job.id, ...target, cwd: job.cwd,
-    sha256: createHash("sha256").update(content).digest("hex") });
+    sha256: createHash("sha256").update(content).digest("hex"),
+    receiptPath: path.join(path.dirname(job.reportPath), `handoff-${job.id}.receipt.json`) });
   expect(copiedText).toContain("刪除上述單一報告");
   expect(copiedText).toContain("任一不符就停止並保留檔案");
   expect(copiedText).toContain("等待我的新執行指令");
