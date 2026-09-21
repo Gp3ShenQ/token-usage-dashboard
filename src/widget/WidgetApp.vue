@@ -51,6 +51,8 @@ const handoffNotice = ref("");
 let handoffTimer: number | null = null;
 let handoffLoading = false;
 const isExactSession = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sessionPrefix);
+const HANDOFF_CONTEXT_THRESHOLD = 72;
+const showHandoffControls = computed(() => isOverlay && (monitor.value?.contextPercent ?? 0) > HANDOFF_CONTEXT_THRESHOLD);
 const canHandoff = computed(() => isExactSession && live.value && !!monitor.value?.cwd &&
   monitor.value.sessionId === sessionPrefix && !monitor.value.readError && !!window.tokenHud?.copyHandoffText);
 const handoffLabel = computed(() => {
@@ -306,7 +308,7 @@ onBeforeUnmount(() => {
         <div class="session-row" :title="'累積 token：' + (monitor?.sessionTokens ?? '未知')"><span>Session tokens</span><strong>{{ tokensText(monitor?.sessionTokens) }}</strong></div>
         <div class="session-row" :title="'本輪 token：' + (monitor?.turnTokens ?? '未知')"><span>本輪增加</span><strong>{{ tokensText(monitor?.turnTokens) }}</strong></div>
         <div class="session-health"><span>{{ healthText }}</span><span>事件 {{ eventAge }}</span></div>
-        <div v-if="isOverlay" class="handoff-controls" data-handoff-controls>
+        <div v-if="showHandoffControls" class="handoff-controls" data-handoff-controls>
           <button type="button" class="handoff-button" :disabled="handoffDisabled" @click="handleHandoff">{{ handoffLabel }}</button>
           <button type="button" class="handoff-button handoff-copy-report" :disabled="handoffBusy || handoff?.phase !== 'ready'" @click="handleCopyHandoffReport">複製交接報告內容</button>
           <span class="handoff-message" role="status" :title="handoffMessage">{{ handoffMessage }}</span>
