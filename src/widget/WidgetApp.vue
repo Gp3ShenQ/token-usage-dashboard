@@ -57,13 +57,14 @@ const canHandoff = computed(() => isExactSession && live.value && !!monitor.valu
   monitor.value.sessionId === sessionPrefix && !monitor.value.readError && !!window.tokenHud?.copyHandoffText);
 const handoffLabel = computed(() => {
   if (handoffBusy.value) return "處理中…";
+  if (handoff.value?.phase === "received") return "已接收，待移除";
   if (handoff.value?.phase === "ready") return "複製接手指令";
   if (handoff.value?.phase === "manual" || handoff.value?.phase === "failed") return "複製交接指令";
   if (handoff.value && ["waiting", "sending", "queued"].includes(handoff.value.phase)) return "等待交接報告";
   return currentAgent.value === "codex" ? "產生交接報告" : "複製交接指令";
 });
 const handoffDisabled = computed(() => handoffBusy.value || (!canHandoff.value && handoff.value?.phase !== "ready") ||
-  (!!handoff.value && ["waiting", "sending", "queued"].includes(handoff.value.phase)));
+  (!!handoff.value && ["waiting", "sending", "queued", "received"].includes(handoff.value.phase)));
 const handoffMessage = computed(() => handoffNotice.value || handoff.value?.message ||
   (!isExactSession ? "需要完整 session 綁定" : !canHandoff.value ? "等待 session 與工作目錄確認" :
     currentAgent.value === "claude" ? "貼到原 AI，由它整理交接" : "原 AI 完成本輪後整理交接"));
@@ -101,7 +102,7 @@ async function handleHandoff() {
   handoffBusy.value = true;
   handoffNotice.value = "";
   try {
-    if (!handoff.value || handoff.value.phase === "removed") {
+    if (!handoff.value || ["removed", "complete"].includes(handoff.value.phase)) {
       handoff.value = await api.handoff(currentAgent.value, sessionPrefix, "prepare",
         currentAgent.value === "codex" ? "queue" : "manual");
     }
