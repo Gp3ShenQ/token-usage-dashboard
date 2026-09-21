@@ -50,7 +50,7 @@ function getRendererTarget(page: "dashboard" | "widget", params?: Record<string,
     ? `${devServerUrl}/${page === "dashboard" ? "" : "widget.html"}`
     : pathToFileURL(path.join(app.getAppPath(), "dist", page === "dashboard" ? "index.html" : "widget.html")).toString();
   const url = new URL(base);
-  if (page === "widget") url.searchParams.set("handoffToken", handoffToken);
+  url.searchParams.set("handoffToken", handoffToken);
 
   for (const [key, value] of Object.entries(params ?? {})) {
     url.searchParams.set(key, value);

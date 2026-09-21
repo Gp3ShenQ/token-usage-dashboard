@@ -1,6 +1,7 @@
 export type { MonitorResult, MonitorSnapshot } from "../server/monitor/state";
 import type { SessionTask, SessionDay } from "../server/types";
 export type { SessionTask, SessionDay } from "../server/types";
+import type { HandoffInventory, HandoffSelection } from "../server/monitor/handoff";
 
 const API_BASE = "http://127.0.0.1:5180";
 
@@ -89,6 +90,16 @@ export type SessionContextResponse =
   | { state: "pending" | "ambiguous" };
 
 export const api = {
+  async handoffRecords(action: "list" | "cleanup", mode?: "completed" | "unreceived", selection?: HandoffSelection[]) {
+    const response = await fetch(API_BASE + "/api/handoffs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-token-hud": new URLSearchParams(location.search).get("handoffToken") ?? "" },
+      body: JSON.stringify({ action, mode, selection, confirmed: action === "cleanup" }),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) throw new Error(result.error ?? "無法處理交接紀錄。");
+    return result.data as HandoffInventory | { removed: string[]; failures: Array<{ id: string; message: string }> };
+  },
   async handoff<T>(source: "claude" | "codex", sessionId: string, action: "status" | "prepare" | "generate" | "receive" | "content", mode?: "queue" | "manual"): Promise<T> {
     const response = await fetch(API_BASE + "/api/handoff", {
       method: "POST",

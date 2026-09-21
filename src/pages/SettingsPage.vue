@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
 import { api, type MetaResponse } from "@/api";
+import HandoffRecords from "@/components/HandoffRecords.vue";
 
 const meta = ref<MetaResponse | null>(null);
 const launchingAgent = ref<"codex" | "claude" | null>(null);
@@ -30,6 +31,7 @@ onMounted(async () => {
       </div>
     </header>
 
+    <HandoffRecords />
     <div class="surface settings-grid">
       <article>
         <p class="surface-title">開啟已標記的終端</p>
