@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { api, type MonitorResult, type SessionContextResponse, type WidgetResponse } from "@/api";
 import { formatResetAt, formatResetCountdown, formatTokenCompact } from "@/utils";
 import { statusLabels, formatTurnDuration, formatEventAge } from "./monitor-display";
@@ -50,6 +50,9 @@ const handoffBusy = ref(false);
 const handoffNotice = ref("");
 let handoffTimer: number | null = null;
 let handoffLoading = false;
+let handoffStatusFailed = false;
+const HANDOFF_ACTIVE_POLL_MS = 2000;
+const HANDOFF_IDLE_POLL_MS = 30_000;
 const isExactSession = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sessionPrefix);
 const HANDOFF_CONTEXT_THRESHOLD = 72;
 const showHandoffControls = computed(() => isOverlay && (monitor.value?.contextPercent ?? 0) > HANDOFF_CONTEXT_THRESHOLD);
@@ -70,18 +73,36 @@ const handoffMessage = computed(() => handoffNotice.value || handoff.value?.mess
     currentAgent.value === "claude" ? "貼到原 AI，由它整理交接" : "原 AI 完成本輪後整理交接"));
 
 async function loadHandoffStatus() {
-  if (!isExactSession || handoffLoading || handoffBusy.value) return;
+  if (disposed || !isOverlay || !isExactSession || handoffLoading) return;
+  if (handoffBusy.value) { resetHandoffTimer(); return; }
   handoffLoading = true;
   try {
     const result = await api.handoff<import("../../server/monitor/handoff").HandoffStatus | null>(currentAgent.value, sessionPrefix, "status");
     if (!disposed) {
+      if (handoffStatusFailed) handoffNotice.value = "";
+      handoffStatusFailed = false;
       if (result?.phase !== handoff.value?.phase) handoffNotice.value = "";
       handoff.value = result;
     }
   } catch (error) {
+    handoffStatusFailed = true;
     if (!disposed) handoffNotice.value = error instanceof Error ? error.message : "無法確認交接狀態。";
-  } finally { handoffLoading = false; }
+  } finally { handoffLoading = false; resetHandoffTimer(); }
 }
+
+function resetHandoffTimer() {
+  if (handoffTimer) window.clearTimeout(handoffTimer);
+  handoffTimer = null;
+  if (disposed || !isOverlay || !isExactSession) return;
+  const phase = handoff.value?.phase;
+  const interval = handoffStatusFailed || phase === "ready" || phase === "received"
+    ? HANDOFF_IDLE_POLL_MS
+    : phase && ["manual", "waiting", "sending", "queued"].includes(phase) ? HANDOFF_ACTIVE_POLL_MS : null;
+  if (interval) handoffTimer = window.setTimeout(() => void loadHandoffStatus(), interval);
+}
+
+watch(() => handoff.value?.phase, resetHandoffTimer);
+watch(showHandoffControls, visible => { if (visible) void loadHandoffStatus(); });
 
 async function handleCopyHandoffReport() {
   if (handoffBusy.value || handoff.value?.phase !== "ready") return;
@@ -203,10 +224,7 @@ async function resetTimers() {
 
 onMounted(async () => {
   connectMonitor();
-  if (isOverlay) {
-    void loadHandoffStatus();
-    handoffTimer = window.setInterval(() => void loadHandoffStatus(), 2000);
-  }
+  if (isOverlay) void loadHandoffStatus();
   clockTimer = window.setInterval(() => { now.value = Date.now(); }, 1000);
   const saved = await window.tokenHud?.getWidgetSettings().catch(() => undefined);
   if (disposed) return;
@@ -222,7 +240,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   disposed = true;
   stream?.close();
-  if (handoffTimer) window.clearInterval(handoffTimer);
+  if (handoffTimer) window.clearTimeout(handoffTimer);
   if (clockTimer) window.clearInterval(clockTimer);
   if (refreshTimer) {
     window.clearInterval(refreshTimer);
