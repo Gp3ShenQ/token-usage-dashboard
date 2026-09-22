@@ -1,7 +1,7 @@
 export type { MonitorResult, MonitorSnapshot } from "../server/monitor/state";
 import type { SessionTask, SessionDay } from "../server/types";
 export type { SessionTask, SessionDay } from "../server/types";
-import type { HandoffInventory, HandoffSelection } from "../server/monitor/handoff";
+import type { HandoffInventory, HandoffSelection, HandoffQuery } from "../server/monitor/handoff";
 
 const API_BASE = "http://127.0.0.1:5180";
 
@@ -90,11 +90,11 @@ export type SessionContextResponse =
   | { state: "pending" | "ambiguous" };
 
 export const api = {
-  async handoffRecords(action: "list" | "cleanup", mode?: "completed" | "unreceived", selection?: HandoffSelection[]) {
+  async handoffRecords(action: "list" | "cleanup", mode?: "completed" | "unreceived", selection?: HandoffSelection[], query?: HandoffQuery) {
     const response = await fetch(API_BASE + "/api/handoffs", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-token-hud": new URLSearchParams(location.search).get("handoffToken") ?? "" },
-      body: JSON.stringify({ action, mode, selection, confirmed: action === "cleanup" }),
+      body: JSON.stringify({ action, mode, selection, query, confirmed: action === "cleanup" }),
     });
     const result = await response.json();
     if (!response.ok || !result.ok) throw new Error(result.error ?? "無法處理交接紀錄。");

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref } from "vue";
 import { api } from "@/api";
-import type { HandoffInventory, HandoffRecord, HandoffSelection } from "../../server/monitor/handoff";
+import type { HandoffInventory, HandoffRecord, HandoffSelection, HandoffQuery } from "../../server/monitor/handoff";
 
 const inventory = ref<HandoffInventory>({ records: [], warnings: [] });
 const loading = ref(false);
@@ -10,7 +10,15 @@ const notice = ref("");
 const selected = ref<string[]>([]);
 const confirmation = ref<{ mode: "completed" | "unreceived"; records: HandoffRecord[] } | null>(null);
 const dialog = ref<HTMLDialogElement | null>(null);
+const CLEANUP_BATCH_SIZE = 200;
+const page = ref(1);
+const sourceFilter = ref("");
+const projectFilter = ref("");
+const receptionFilter = ref("");
+const activeFilters = ref<HandoffQuery>({});
+const pageCount = computed(() => Math.max(1, Math.ceil((inventory.value.total ?? inventory.value.records.length) / 50)));
 const completed = computed(() => inventory.value.records.filter(record => record.reception === "complete"));
+const completedCount = computed(() => inventory.value.completedCount ?? completed.value.length);
 const canDiscard = (record: HandoffRecord) => ["awaiting", "discarded"].includes(record.reception) && !["waiting", "sending", "queued"].includes(record.phase);
 const selectedRecords = computed(() => inventory.value.records.filter(record => selected.value.includes(record.id) && canDiscard(record)));
 const statusText = (record: HandoffRecord) => ({
@@ -27,16 +35,47 @@ async function loadRecords() {
   loading.value = true;
   error.value = "";
   try {
-    inventory.value = await api.handoffRecords("list") as HandoffInventory;
+    inventory.value = await api.handoffRecords("list", undefined, undefined, { ...activeFilters.value, page: page.value }) as HandoffInventory;
+    page.value = inventory.value.page ?? page.value;
     selected.value = selected.value.filter(id => inventory.value.records.some(record => record.id === id && canDiscard(record)));
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : "無法載入交接紀錄。";
   } finally { loading.value = false; }
 }
 
+async function handleFilter() {
+  if (loading.value) return;
+  activeFilters.value = {
+    source: (sourceFilter.value || undefined) as HandoffQuery["source"],
+    project: projectFilter.value.trim() || undefined,
+    reception: (receptionFilter.value || undefined) as HandoffQuery["reception"],
+  };
+  page.value = 1;
+  selected.value = [];
+  await loadRecords();
+}
+
+async function handlePage(nextPage: number) {
+  if (loading.value) return;
+  page.value = nextPage;
+  selected.value = [];
+  await loadRecords();
+}
+
 async function confirmCleanup(mode: "completed" | "unreceived") {
-  const records = mode === "completed" ? completed.value : selectedRecords.value;
-  if (loading.value || !records.length) return;
+  if (loading.value) return;
+  let records = selectedRecords.value;
+  if (mode === "completed") {
+    loading.value = true;
+    try {
+      const result = await api.handoffRecords("list", undefined, undefined, { ...activeFilters.value, reception: "complete" }) as HandoffInventory;
+      records = result.records;
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : "無法核對清理範圍。";
+      return;
+    } finally { loading.value = false; }
+  }
+  if (!records.length) return;
   confirmation.value = { mode, records: [...records] };
   await nextTick();
   dialog.value?.showModal();
@@ -56,17 +95,32 @@ async function handleCleanup() {
   const selection: HandoffSelection[] = confirmation.value.records.map(record => ({
     source: record.source, sessionId: record.sessionId, id: record.id, digest: record.digest!,
   }));
+  const results = { removed: [] as string[], failures: [] as Array<{ id: string; message: string }> };
+  let processed = 0;
+  let interrupted = "";
   try {
-    const result = await api.handoffRecords("cleanup", confirmation.value.mode, selection) as {
-      removed: string[]; failures: Array<{ id: string; message: string }>;
-    };
-    notice.value = `已清理 ${result.removed.length} 筆。` + result.failures.map(item => `${item.id}：${item.message}`).join("；");
+    for (let start = 0; start < selection.length; start += CLEANUP_BATCH_SIZE) {
+      const batch = selection.slice(start, start + CLEANUP_BATCH_SIZE);
+      const result = await api.handoffRecords("cleanup", confirmation.value.mode, batch) as {
+        removed: string[]; failures: Array<{ id: string; message: string }>;
+      };
+      results.removed.push(...result.removed);
+      results.failures.push(...result.failures);
+      processed += batch.length;
+    }
+  } catch (cause) {
+    const uncertain = Math.min(CLEANUP_BATCH_SIZE, selection.length - processed);
+    interrupted = `；${uncertain} 筆結果未確認，${selection.length - processed - uncertain} 筆未處理。${cause instanceof Error ? cause.message : "清理請求失敗。"}`;
+  }
+  try {
+    const failureText = results.failures.length
+      ? `；${results.failures.length} 筆失敗：${results.failures.map(item => `${item.id}：${item.message}`).join("；")}`
+      : "";
+    notice.value = `已清理 ${results.removed.length} 筆${failureText}${interrupted}`;
     selected.value = [];
     dialog.value?.close();
     confirmation.value = null;
     await loadRecords();
-  } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : "清理失敗。";
   } finally { loading.value = false; }
 }
 
@@ -83,14 +137,21 @@ onMounted(loadRecords);
       <button class="scan-button" type="button" :disabled="loading" @click="loadRecords">重新整理</button>
     </div>
     <div class="records-actions">
-      <button class="scan-button" type="button" :disabled="loading || !completed.length || !!error" @click="confirmCleanup('completed')">清理已完成紀錄（{{ completed.length }}）</button>
+      <button class="scan-button" type="button" :disabled="loading || !completedCount || !!error" @click="confirmCleanup('completed')">清理已完成紀錄（{{ completedCount }}）</button>
       <button class="scan-button" type="button" :disabled="loading || !selectedRecords.length || !!error" @click="confirmCleanup('unreceived')">刪除選取的未接收報告（{{ selectedRecords.length }}）</button>
     </div>
+    <form class="records-actions" @submit.prevent="handleFilter">
+      <label>來源 <select v-model="sourceFilter" :disabled="loading"><option value="">全部</option><option value="claude">Claude</option><option value="codex">Codex</option></select></label>
+      <label>專案 <input v-model="projectFilter" :disabled="loading" maxlength="1000" placeholder="工作目錄關鍵字" /></label>
+      <label>狀態 <select v-model="receptionFilter" :disabled="loading"><option value="">全部</option><option value="pending">等待產生／失敗</option><option value="awaiting">等待接收</option><option value="received">已接收，待移除</option><option value="complete">接收完成</option><option value="missing">接收未確認</option><option value="discarded">已手動刪除</option></select></label>
+      <button class="scan-button" type="submit" :disabled="loading">套用篩選</button>
+    </form>
+    <p class="records-note">已完成紀錄清理涵蓋目前篩選結果的所有頁；未接收報告只選取本頁，換頁會清除選取。</p>
     <p v-if="error && !confirmation" role="alert">{{ error }}</p>
     <p v-if="notice" role="status">{{ notice }}</p>
     <p v-for="warning in inventory.warnings" :key="warning" class="records-warning" role="alert">{{ warning }}</p>
     <p v-if="loading && !inventory.records.length" role="status">載入交接紀錄…</p>
-    <p v-else-if="!inventory.records.length && !error" class="records-note">尚無交接紀錄。</p>
+    <p v-else-if="!inventory.records.length && !error" class="records-note">沒有符合條件的交接紀錄。</p>
     <div v-else class="records-table-wrap">
       <table>
         <caption class="records-note">未接收報告須個別選取；已接收但未移除的報告不列入清理。</caption>
@@ -106,6 +167,11 @@ onMounted(loadRecords);
         </tbody>
       </table>
     </div>
+    <nav class="records-actions" aria-label="交接紀錄分頁">
+      <button class="scan-button" type="button" :disabled="loading || page <= 1 || !!error" @click="handlePage(page - 1)">上一頁</button>
+      <span role="status">第 {{ page }} / {{ pageCount }} 頁 · 共 {{ inventory.total ?? inventory.records.length }} 筆</span>
+      <button class="scan-button" type="button" :disabled="loading || page >= pageCount || !!error" @click="handlePage(page + 1)">下一頁</button>
+    </nav>
     <dialog ref="dialog" aria-labelledby="cleanup-title" aria-describedby="cleanup-description" @cancel.prevent="cancelCleanup">
       <template v-if="confirmation">
         <h3 id="cleanup-title">{{ confirmation.mode === 'completed' ? '清理已完成紀錄' : '刪除未接收報告' }}</h3>
@@ -125,6 +191,8 @@ onMounted(loadRecords);
 .handoff-records { margin: 24px 0; }
 .records-heading, .records-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .records-heading { justify-content: space-between; }
+form.records-actions, nav.records-actions { margin-top: 12px; }
+select, input:not([type="checkbox"]) { max-width: 100%; padding: 6px; border: 1px solid var(--stroke); border-radius: 6px; background: var(--bg-panel); color: var(--text); font: inherit; }
 h3 { margin: 0 0 8px; }
 .records-note, small { color: var(--muted); font-size: 0.85rem; overflow-wrap: anywhere; }
 .records-warning, [role="alert"] { color: #9c442a; overflow-wrap: anywhere; }
