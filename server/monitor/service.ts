@@ -14,13 +14,16 @@ type SessionEntry = {
   job?: Promise<void>;
   notification?: NodeJS.Timeout;
   notifiedTurn: string | null;
+  lastAccessAt: number;
 };
 type MonitorOptions = { claudeRoot?: string; codexRoot?: string; eventRoot?: string };
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const SESSION_IDLE_TTL_MS = 5 * 60_000;
 
 export class SessionMonitorService {
   private roots: Array<{ path: string; kind: "log" | "hook"; source?: AgentSource }>;
   private files = new Map<string, SourceFile>();
+  private sessionFiles = new Map<string, Map<string, SourceFile>>();
   private sessions = new Map<string, SessionEntry>();
   private watchers = new Map<string, fs.FSWatcher>();
   private listeners = new Set<() => void>();
@@ -44,7 +47,12 @@ export class SessionMonitorService {
     await this.discover();
     this.recoveryTimer = setInterval(() => {
       void this.discover().then(() => {
-        for (const key of this.sessions.keys()) void this.refresh(key);
+        for (const [key, entry] of this.sessions) {
+          if (Date.now() - entry.lastAccessAt >= SESSION_IDLE_TTL_MS &&
+              !["running", "waiting_input", "waiting_approval"].includes(entry.state.data.status) && !entry.notification && !entry.job) {
+            this.sessions.delete(key);
+          } else void this.refresh(key);
+        }
       });
     }, 30_000);
     this.recoveryTimer.unref();
@@ -61,8 +69,12 @@ export class SessionMonitorService {
     const source = root.source ?? match[1] as AgentSource;
     const sessionId = root.kind === "hook" ? match[2] : match[1];
     const isNew = !this.files.has(filePath);
-    this.files.set(filePath, { path: filePath, kind: root.kind, source, sessionId });
+    const file = { path: filePath, kind: root.kind, source, sessionId };
+    this.files.set(filePath, file);
     const key = this.key(source, sessionId);
+    let indexedFiles = this.sessionFiles.get(key);
+    if (!indexedFiles) { indexedFiles = new Map(); this.sessionFiles.set(key, indexedFiles); }
+    indexedFiles.set(filePath, file);
     if (this.sessions.has(key)) void this.refresh(key);
     if (isNew) this.emit();
   }
@@ -93,16 +105,19 @@ export class SessionMonitorService {
 
   async get(source: AgentSource, prefix: string): Promise<MonitorResult> {
     if (!/^[a-zA-Z0-9_-]{8,128}$/.test(prefix)) return { state: "pending" };
-    const ids = new Set([...this.files.values()].filter(file => file.source === source && file.sessionId.startsWith(prefix)).map(file => file.sessionId));
-    if (ids.size !== 1) return { state: ids.size ? "ambiguous" : "pending" };
-    const sessionId = [...ids][0];
+    const prefixKey = this.key(source, prefix);
+    const keys = /^[a-f0-9-]{36}$/i.test(prefix) && this.sessionFiles.has(prefixKey)
+      ? [prefixKey] : [...this.sessionFiles.keys()].filter(key => key.startsWith(prefixKey));
+    if (keys.length !== 1) return { state: keys.length ? "ambiguous" : "pending" };
+    const sessionId = keys[0].slice(source.length + 1);
     const key = this.key(source, sessionId);
     let entry = this.sessions.get(key);
     if (!entry) {
-      entry = { state: new SessionMonitorState(source, sessionId), cursors: new Map(), initialized: false, dirty: false, notifiedTurn: null };
+      entry = { state: new SessionMonitorState(source, sessionId), cursors: new Map(), initialized: false, dirty: false, notifiedTurn: null, lastAccessAt: Date.now() };
       this.sessions.set(key, entry);
       await this.refresh(key);
     } else if (!entry.initialized) await entry.job;
+    entry.lastAccessAt = Date.now();
     return { state: "ready", data: { ...entry.state.data } };
   }
 
@@ -133,7 +148,7 @@ export class SessionMonitorService {
   }
 
   private async readSession(key: string, entry: SessionEntry) {
-    const files = [...this.files.values()].filter(file => this.key(file.source, file.sessionId) === key)
+    const files = [...(this.sessionFiles.get(key)?.values() ?? [])]
       .sort((left, right) => (left.kind === "hook" ? 0 : 1) - (right.kind === "hook" ? 0 : 1));
     let readError = false;
     let rebuilt = false;

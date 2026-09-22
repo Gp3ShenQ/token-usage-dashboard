@@ -13,6 +13,30 @@ const id = "12345678-1111-2222-3333-444444444444";
 const otherId = "12345678-1111-2222-3333-555555555555";
 const line = (value: unknown) => JSON.stringify(value) + "\n";
 
+it("releases an unobserved idle session and rebuilds it without replaying completion notifications", async () => {
+  const { service, options } = await fixture();
+  const file = path.join(options.claudeRoot, id + ".jsonl");
+  await fs.writeFile(file, line({ timestamp: new Date().toISOString(), message: {
+    role: "assistant", id: "fixture", model: "test", usage: { input_tokens: 123 },
+  } }));
+  vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+  try {
+    await service.start();
+    const notifications: MonitorSnapshot[] = [];
+    service.onComplete(data => notifications.push(data));
+    expect((await snapshot(service)).sessionTokens).toBe(123);
+    vi.setSystemTime(Date.now() + 6 * 60_000);
+    await vi.advanceTimersByTimeAsync(30_000);
+    const stat = vi.spyOn(fs, "stat");
+    try {
+      expect((await snapshot(service)).sessionTokens).toBe(123);
+      expect(stat.mock.calls.some(([filename]) => filename === file)).toBe(true);
+      expect(notifications).toEqual([]);
+    } finally { stat.mockRestore(); }
+    await service.close();
+  } finally { vi.useRealTimers(); }
+});
+
 async function fixture() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "hud-monitor-"));
   cleanups.push(() => fs.rm(root, { recursive: true, force: true }));
