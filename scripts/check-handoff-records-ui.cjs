@@ -2,6 +2,7 @@ const { app, BrowserWindow, session } = require("electron");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
+const { randomUUID } = require("node:crypto");
 const { pathToFileURL } = require("node:url");
 const Fastify = require("fastify");
 
@@ -110,7 +111,7 @@ app.whenReady().then(async () => {
   rejectList = true;
   await clickButton("重新整理");
   await waitFor("document.querySelector('[role=alert]')?.textContent.includes('測試載入失敗')");
-  check("load errors are shown and cleanup controls are disabled", await run("Array.from(document.querySelectorAll('.records-actions > button')).every(button=>button.disabled)"));
+  check("load errors are shown and cleanup controls are disabled", await run("Array.from(document.querySelectorAll('.records-actions > button')).filter(button=>/清理已完成|刪除選取/.test(button.textContent)).every(button=>button.disabled)"));
   rejectList = false;
   await clickButton("重新整理");
   await waitFor("!document.querySelector('[role=alert]') && document.querySelector('[aria-busy]').getAttribute('aria-busy') === 'false'");
@@ -118,5 +119,25 @@ app.whenReady().then(async () => {
   await fs.writeFile(path.join(output, "records.png"), await window.webContents.capturePage().then(image => image.toPNG()));
   check("no unexpected renderer errors", errors.length === 0);
   check("missing report remains unconfirmed", (await service.listRecords()).records.find(record=>record.id===missing.job.id).reception === "missing");
+  for (let index = 0; index < 51; index++) {
+    const id = randomUUID();
+    await fs.writeFile(path.join(root, `handoff-${id}.request.json`), JSON.stringify({
+      ...missing.job, id, source: "claude", cwd: path.join(output, "paged-ui"), digest: undefined,
+      reportPath: path.join(root, `handoff-${id}.json`), phase: "manual",
+    }));
+  }
+  await run(`const input = document.querySelector('input[placeholder="工作目錄關鍵字"]');
+    input.value = 'paged-ui'; input.dispatchEvent(new Event('input', {bubbles:true}));`);
+  await clickButton("套用篩選");
+  await waitFor("document.querySelectorAll('[data-handoff-id]').length === 50 && document.querySelector('[aria-busy]').getAttribute('aria-busy') === 'false'");
+  check("filtered records render one page and the matching total", await run("document.querySelector('nav[aria-label=交接紀錄分頁]').textContent.includes('共 51 筆')"));
+  await clickButton("下一頁");
+  await waitFor("document.querySelectorAll('[data-handoff-id]').length === 1 && document.querySelector('[aria-busy]').getAttribute('aria-busy') === 'false'");
+  check("second page renders the remaining record", await run("document.querySelector('nav[aria-label=交接紀錄分頁]').textContent.includes('第 2 / 2 頁')"));
+  await run(`const select = document.querySelector('form select'); select.value = 'codex'; select.dispatchEvent(new Event('change', {bubbles:true}));`);
+  await clickButton("套用篩選");
+  await waitFor("document.querySelectorAll('[data-handoff-id]').length === 0 && document.querySelector('[aria-busy]').getAttribute('aria-busy') === 'false'");
+  check("source and project filters combine and reset pagination", await run("document.querySelector('nav[aria-label=交接紀錄分頁]').textContent.includes('第 1 / 1 頁')"));
+  console.log(JSON.stringify({ checks, output }));
   await finish();
 }).catch(finish);
