@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
 import { afterEach, expect, it, vi } from "vitest";
 import { HandoffService, registerHandoffRoutes, type HandoffReceipt, type HandoffStatus } from "../handoff.js";
@@ -8,6 +9,38 @@ import { SessionMonitorState } from "../state.js";
 
 const target = { source: "codex" as const, sessionId: "12345678-1111-2222-3333-444444444444" };
 const cleanups: Array<() => Promise<unknown>> = [];
+
+it("filters and pages records without duplicating entries across pages", async () => {
+  const { service, job, root } = await fixture();
+  for (let index = 0; index < 52; index++) {
+    const id = randomUUID();
+    await fs.writeFile(path.join(root, `handoff-${id}.request.json`), JSON.stringify({ ...job, id,
+      source: "claude", cwd: path.join(root, "paged-project"), reportPath: path.join(root, `handoff-${id}.json`) }));
+  }
+  const first = await service.listRecords({ source: "claude", project: "paged-project", reception: "pending", page: 1 });
+  const second = await service.listRecords({ source: "claude", project: "paged-project", reception: "pending", page: 2 });
+  expect(first.total).toBe(52);
+  expect(first.records).toHaveLength(50);
+  expect(second.records).toHaveLength(2);
+  expect(new Set([...first.records, ...second.records].map(record => record.id)).size).toBe(52);
+  expect((await service.listRecords({ source: "claude", page: 100 })).page).toBe(2);
+  expect((await service.listRecords({ source: "codex" })).records).toHaveLength(1);
+  await expect(service.listRecords({ page: 0 })).rejects.toThrow("無效");
+});
+
+it("reuses unchanged report inspection but invalidates it when a receipt arrives", async () => {
+  const { service, report, receipt, job } = await fixture();
+  await report();
+  await service.listRecords();
+  const readFile = vi.spyOn(fs, "readFile");
+  expect((await service.listRecords()).records[0].reception).toBe("awaiting");
+  expect(readFile.mock.calls.filter(([file]) => file === job.reportPath)).toHaveLength(0);
+  await receipt();
+  expect((await service.listRecords()).records[0].reception).toBe("received");
+  expect(readFile.mock.calls.some(([file]) => file === job.reportPath)).toBe(true);
+  await fs.unlink(job.reportPath);
+  expect((await service.listRecords()).records[0].reception).toBe("complete");
+});
 afterEach(async () => { vi.restoreAllMocks(); for (const cleanup of cleanups.reverse()) await cleanup(); cleanups.length = 0; });
 
 async function fixture() {
@@ -50,6 +83,15 @@ it("tracks waiting, received, removal and restored completion without treating r
   const restored = new HandoffService(options);
   cleanups.push(() => restored.close());
   expect((await restored.listRecords()).records[0]).toMatchObject({ reception: "complete", reportBytes: null });
+});
+
+it("stops status polling once a handoff is complete", async () => {
+  const { service, report, receipt, job } = await fixture();
+  await report();
+  await receipt();
+  await fs.unlink(job.reportPath);
+  await service.status(target);
+  expect((service as unknown as { timer: NodeJS.Timeout | undefined }).timer).toBeUndefined();
 });
 
 it("does not infer reception when an old report disappears without a receipt", async () => {

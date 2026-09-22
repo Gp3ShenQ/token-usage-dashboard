@@ -18,7 +18,8 @@ export type HandoffRecord = HandoffStatus & {
   reception: "pending" | "awaiting" | "received" | "complete" | "missing" | "discarded";
 };
 export type HandoffSelection = Target & { id: string; digest: string };
-export type HandoffInventory = { records: HandoffRecord[]; warnings: string[] };
+export type HandoffQuery = { page?: number; source?: AgentSource; project?: string; reception?: HandoffRecord["reception"] };
+export type HandoffInventory = { records: HandoffRecord[]; warnings: string[]; total?: number; page?: number; completedCount?: number };
 export type HandoffStatus = Target & {
   id: string; cwd: string; createdAt: string; reportPath: string;
   phase: Phase; message: string; digest?: string;
@@ -86,6 +87,7 @@ export function buildReceptionPrompt(job: HandoffStatus, content?: string) {
 }
 
 export class HandoffService {
+  private inventoryCache = new Map<string, { signature: string; record: HandoffRecord }>();
   private jobs = new Map<string, HandoffStatus>();
   private locks = new Map<string, Promise<unknown>>();
   private timer?: NodeJS.Timeout;
@@ -223,13 +225,21 @@ export class HandoffService {
   }
 
   private startTimer() {
+    const activeJobs = [...this.jobs.values()].filter(job => this.needsStatusPolling(job));
+    if (!activeJobs.length) {
+      if (this.timer) clearInterval(this.timer);
+      this.timer = undefined;
+      return;
+    }
     if (this.timer || this.closed) return;
     this.timer = setInterval(() => {
-      for (const job of this.jobs.values()) {
-        if (!["ready", "removed", "failed"].includes(job.phase)) void this.status(job).catch(() => undefined);
-      }
+      for (const job of this.jobs.values()) if (this.needsStatusPolling(job)) void this.status(job).catch(() => undefined);
     }, 2000);
     this.timer.unref();
+  }
+
+  private needsStatusPolling(job: HandoffStatus) {
+    return ["manual", "waiting", "sending", "queued", "received"].includes(job.phase);
   }
 
   private async readReport(job: HandoffStatus): Promise<{ digest: string; content: string } | null> {
@@ -327,19 +337,52 @@ export class HandoffService {
     }
   }
 
-  async listRecords(): Promise<HandoffInventory> {
+  async listRecords(query: HandoffQuery = {}): Promise<HandoffInventory> {
+    if (!query || typeof query !== "object" ||
+        (query.page !== undefined && (!Number.isSafeInteger(query.page) || query.page < 1)) ||
+        (query.source !== undefined && !["claude", "codex"].includes(query.source)) ||
+        (query.project !== undefined && (typeof query.project !== "string" || query.project.length > 1000)) ||
+        (query.reception !== undefined && !["pending", "awaiting", "received", "complete", "missing", "discarded"].includes(query.reception))) {
+      throw new Error("無效的交接篩選條件。");
+    }
     const records: HandoffRecord[] = [];
     const warnings: string[] = [];
-    for (const file of await this.recordFiles()) {
+    const files = await this.recordFiles();
+    const existingFiles = new Set(files);
+    for (const cachedFile of this.inventoryCache.keys()) if (!existingFiles.has(cachedFile)) this.inventoryCache.delete(cachedFile);
+    for (const file of files) {
       try {
         const initial = await this.readJob(file);
-        const record = await this.exclusive(initial, async () => this.inspect(await this.readJob(file)));
+        if (query.source && initial.source !== query.source) continue;
+        if (query.project && !initial.cwd.toLowerCase().includes(query.project.toLowerCase())) continue;
+        const record = await this.exclusive(initial, async () => {
+          const signature = JSON.stringify(await Promise.all([file, initial.reportPath, this.receiptPath(initial.id)].map(async filename => {
+            try {
+              const stat = await fs.lstat(filename);
+              return [stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs, stat.isFile(), stat.isSymbolicLink()];
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+              throw error;
+            }
+          })));
+          const cached = this.inventoryCache.get(file);
+          if (cached?.signature === signature) return cached.record;
+          const inspected = await this.inspect(await this.readJob(file));
+          // Listing cache only; cleanup and status always perform fresh validation.
+          if (cached || this.inventoryCache.size < 500) this.inventoryCache.set(file, { signature, record: inspected });
+          return inspected;
+        });
+        if (query.reception && record.reception !== query.reception) continue;
         records.push(record);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") warnings.push(`${path.basename(file)}：${error instanceof Error ? error.message : "無法核對，已保留。"}`);
       }
     }
-    return { records: records.sort((left, right) => right.createdAt.localeCompare(left.createdAt)), warnings };
+    records.sort((left, right) => right.createdAt.localeCompare(left.createdAt) || left.id.localeCompare(right.id));
+    const total = records.length;
+    const completedCount = records.filter(record => record.reception === "complete").length;
+    const page = query.page === undefined ? undefined : Math.min(query.page, Math.max(1, Math.ceil(total / 50)));
+    return { records: page === undefined ? records : records.slice((page - 1) * 50, page * 50), warnings, total, page, completedCount };
   }
 
   async cleanup(selection: HandoffSelection[], mode: "completed" | "unreceived") {
@@ -390,6 +433,7 @@ export class HandoffService {
         failures.push({ id: item.id, message: error instanceof Error ? error.message : "清理失敗，請重新整理。" });
       }
     }
+    this.startTimer();
     return { removed, failures };
   }
 
@@ -401,11 +445,11 @@ export class HandoffService {
 }
 
 export function registerHandoffRoutes(app: FastifyInstance, service: HandoffService, token: string) {
-  app.post<{ Body: { action: "list" | "cleanup"; mode?: "completed" | "unreceived"; selection?: HandoffSelection[]; confirmed?: boolean } }>(
+  app.post<{ Body: { action: "list" | "cleanup"; query?: HandoffQuery; mode?: "completed" | "unreceived"; selection?: HandoffSelection[]; confirmed?: boolean } }>(
     "/api/handoffs", async (request, reply) => {
       if (!token || request.headers["x-token-hud"] !== token) return reply.code(403).send({ ok: false, error: "交接請求未授權。" });
       try {
-        if (request.body?.action === "list") return { ok: true, data: await service.listRecords() };
+        if (request.body?.action === "list") return { ok: true, data: await service.listRecords(request.body.query) };
         if (request.body?.action === "cleanup" && request.body.confirmed === true) {
           return { ok: true, data: await service.cleanup(request.body.selection!, request.body.mode!) };
         }
