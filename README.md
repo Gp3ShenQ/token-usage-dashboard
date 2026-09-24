@@ -12,29 +12,63 @@ Widget 不需要手動切換 Claude 或 Codex。當前景 PowerShell 終端以 `
 
 1. 新分頁標題固定為 `Codex · <分頁短碼>` 或 `Claude · <分頁短碼>`，且 Windows Terminal 會禁止 CLI 覆寫它。
 2. 啟動腳本在本機偵測或指定實際 session ID，寫入 `%LOCALAPPDATA%\TokenUsageDashboard\session-bindings\` 的對應檔。
-3. Dashboard 以目前選中分頁的 agent + 分頁短碼讀取對應檔，查找正確 session，顯示最新一次送出的 input tokens。
+3. Dashboard 以目前選中分頁的 agent + 分頁短碼讀取對應檔，查找正確 session，顯示任務狀態、模型與 Context 使用率。
 
 同一個 Windows Terminal 視窗的多個 tab 共用程序樹，無法用 PID 辨識目前選中的 tab。因此 Dashboard 不再用程序樹猜測 agent，也不會受 Claude 思考時的動態標題影響。只有由上述 wrapper 開啟、標題符合固定格式的分頁才會被辨識；舊分頁會顯示「等資料」，避免誤判成另一個 agent。
 
-PowerShell profile 位置為 `$PROFILE`。因此修改 profile 或 Windows Terminal 設定後必須重新開 PowerShell；既有 session 沒有短 ID 標題時，Widget 會顯示「等資料」。
+### 設定 PowerShell profile
+
+在 PowerShell 執行 `notepad $PROFILE`，加入一行（路徑改成本 repo 的實際位置）：
+
+```powershell
+. "<repo>\scripts\agent-wrappers.ps1"
+```
+
+`agent-wrappers.ps1` 會從 `PATH` 找出 `codex` 與 `claude` 的實際執行檔，並以同名函式包裝；找不到的 CLI 不會被包裝。若要替特定專案建立捷徑，可在 profile 自行加上：
+
+```powershell
+function claude-myapp {
+  & $tokenUsageDashboardWrapper -Agent claude -ExecutablePath $claudeExecutable -WorkingDirectory 'D:\src\myapp' -AgentArguments $args
+}
+```
+
+修改 profile 或 Windows Terminal 設定後必須重新開 PowerShell；既有 session 沒有短 ID 標題時，Widget 會顯示「等資料」。
 
 注意：從互動式 PowerShell 輸入的 `codex` 或 `claude`（包含帶明確 UUID 的 `--resume` 等參數）都會經過 wrapper，並開啟受控新分頁。若是自動化腳本，請直接使用 CLI 的完整執行檔路徑，避免不需要的 wrapper 監測。Claude 的新 session 會先指定 session ID；Codex 則在啟動後最多 45 秒內偵測新建的 JSONL 取得 ID。
 
-## Context 警示
+## 工作階段監測（hook / statusLine）
 
-「最新送出」使用該 session 最新一筆 JSONL 的 `input_tokens`，不是累積用量，也不包含 output 或 cache tokens。
+任務狀態、Claude 的 Context 使用率與「本輪回覆已結束」通知需要安裝 monitor：
 
-- 未滿 50k：正常
-- 50k 以上：黃色，建議準備交接
-- 100k 以上：紅色，建議開新 session
+```powershell
+node scripts/install-monitor.mjs   # 預覽：只列出會變更的檔案，不寫入
+npm run monitor:install            # 實際安裝
+```
 
-若短 ID 尚未掃描到或不唯一，Widget 不會猜測 session，而會顯示等待狀態。
+- Claude：在 `~/.claude/settings.json` 加入 `scripts/monitor-hook.mjs` hooks，並以 `scripts/monitor-statusline.mjs` 包裝既有 statusLine（原輸出不變；既有 statusLine 必須是單一 Node 腳本，否則不會修改）。
+- Codex：在 `~/.codex/config.toml` 加入以標記包住的 hooks 區塊，安裝後請到 Codex `/hooks` 確認信任。
+- 寫入前會在原檔旁建立 `.token-hud-<時間>.bak` 備份；重複執行不會重複加入。
+- 事件寫入 `%LOCALAPPDATA%\TokenUsageDashboard\monitor\`，只記錄事件類型、工具名稱、模型與 Context 資訊，不含對話內容。
+
+## Context 使用率
+
+Widget 顯示目前 session 的 Context 百分比：
+
+- Claude：取自 statusLine 回報的 `context_window.used_percentage`，需先安裝 monitor。
+- Codex：以 JSONL 最新一筆 `last_token_usage.total_tokens` ÷ `model_context_window` 估算，標示為「Context ≈」。
+
+若分頁短碼尚未綁定或 session 不唯一，Widget 不會猜測 session，而會顯示「等資料」。
 
 ## 開發與打包
 
+需求：Windows、Node.js、Windows Terminal、PowerShell 7。
+
 ```powershell
+npm install
 npm run dev
 npm run typecheck
+npm run test:monitor      # vitest 單元測試
+npm run test:monitor-ui   # Electron UI 檢查
 npm run build
 ```
 
