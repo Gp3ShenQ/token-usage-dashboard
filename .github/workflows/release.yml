@@ -14,15 +14,20 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
+  build:
+    # A manual run from another branch must never publish.
+    if: github.ref == 'refs/heads/main'
     runs-on: windows-latest
     timeout-minutes: 40
-    permissions:
-      contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      exists: ${{ steps.version.outputs.exists }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Read version
         id: version
@@ -43,11 +48,8 @@ jobs:
         run: npm run build:main
       - if: steps.version.outputs.exists == 'false'
         run: npm run test:monitor
-
-      - name: Build
-        if: steps.version.outputs.exists == 'false'
+      - if: steps.version.outputs.exists == 'false'
         run: npm run build
-
       - if: steps.version.outputs.exists == 'false'
         run: npx electron scripts/check-monitor-ui.cjs --packaged
       - if: steps.version.outputs.exists == 'false'
@@ -56,17 +58,51 @@ jobs:
         if: steps.version.outputs.exists == 'false'
         run: ./scripts/smoke-packaged.ps1
 
-      - name: Publish release
+      - name: Checksum
         if: steps.version.outputs.exists == 'false'
         shell: bash
+        working-directory: release
+        run: sha256sum token-usage-dashboard-portable.exe > token-usage-dashboard-portable.exe.sha256
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.version.outputs.exists == 'false'
+        with:
+          name: release-assets
+          path: |
+            release/token-usage-dashboard-portable.exe
+            release/token-usage-dashboard-portable.exe.sha256
+          retention-days: 1
+
+  publish:
+    # Only this job holds write access; it runs no project code.
+    needs: build
+    if: needs.build.outputs.exists == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets
+
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
         run: |
-          cd release
-          sha256sum token-usage-dashboard-portable.exe > token-usage-dashboard-portable.exe.sha256
-          gh release create "${{ steps.version.outputs.tag }}" \
+          # A failed earlier attempt can leave a draft (drafts create no tag); replace it.
+          gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id" |
+            xargs -r -I{} gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/{}"
+          gh release create "$TAG" \
             token-usage-dashboard-portable.exe \
             token-usage-dashboard-portable.exe.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "${{ steps.version.outputs.tag }}" \
-            --generate-notes ${{ steps.version.outputs.prerelease }}
+            --title "$TAG" \
+            --generate-notes \
+            --draft $PRERELEASE
+          # Publishing last means the tag appears only once every asset is uploaded.
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
