@@ -15,6 +15,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Required check on main: only this repository's dev branch may merge into it.
+  source-branch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Only dev may merge into main
+        env:
+          BASE: ${{ github.base_ref }}
+          HEAD: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          if [ "$BASE" = "main" ] && { [ "$HEAD" != "dev" ] || [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; }; then
+            echo "::error::Only $GITHUB_REPOSITORY:dev may merge into main (got $HEAD_REPO:$HEAD)."
+            exit 1
+          fi
+          echo "Source branch OK"
+
   check:
     runs-on: windows-latest
     timeout-minutes: 20
@@ -30,7 +47,8 @@ jobs:
           cache: npm
 
       - run: npm ci
-      - run: node scripts/check-version.mjs
+      - name: Preview next release
+        run: node scripts/release-version.mjs
       - run: npm run typecheck
       - run: npm run build:main
       - run: npm run test:monitor

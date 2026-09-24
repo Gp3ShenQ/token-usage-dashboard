@@ -1,6 +1,6 @@
 name: Release
 
-# Publishes a release when main carries a package.json version that has no tag yet.
+# Every merge into main publishes a release; the version comes from scripts/release-version.mjs.
 on:
   push:
     branches: [main]
@@ -20,8 +20,8 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 40
     outputs:
+      release: ${{ steps.version.outputs.release }}
       tag: ${{ steps.version.outputs.tag }}
-      exists: ${{ steps.version.outputs.exists }}
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -31,41 +31,44 @@ jobs:
 
       - name: Read version
         id: version
-        run: node scripts/check-version.mjs
+        run: node scripts/release-version.mjs
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        if: steps.version.outputs.exists == 'false'
+        if: steps.version.outputs.release == 'true'
         with:
           node-version: 22
           cache: npm
 
       # Each native command gets its own step so a failing exit code is never masked.
-      - if: steps.version.outputs.exists == 'false'
+      - if: steps.version.outputs.release == 'true'
         run: npm ci
-      - if: steps.version.outputs.exists == 'false'
+      - if: steps.version.outputs.release == 'true'
         run: npm run typecheck
-      - if: steps.version.outputs.exists == 'false'
+      - if: steps.version.outputs.release == 'true'
         run: npm run build:main
-      - if: steps.version.outputs.exists == 'false'
+      - if: steps.version.outputs.release == 'true'
         run: npm run test:monitor
-      - if: steps.version.outputs.exists == 'false'
+      # The tag is the source of truth; package.json is only stamped for this build.
+      - if: steps.version.outputs.release == 'true'
+        run: npm version ${{ steps.version.outputs.version }} --no-git-tag-version --allow-same-version
+      - if: steps.version.outputs.release == 'true'
         run: npm run build
-      - if: steps.version.outputs.exists == 'false'
+      - if: steps.version.outputs.release == 'true'
         run: npx electron scripts/check-monitor-ui.cjs --packaged
-      - if: steps.version.outputs.exists == 'false'
+      - if: steps.version.outputs.release == 'true'
         run: npx electron scripts/check-handoff-records-ui.cjs --packaged
       - name: Smoke test packaged app
-        if: steps.version.outputs.exists == 'false'
+        if: steps.version.outputs.release == 'true'
         run: ./scripts/smoke-packaged.ps1
 
       - name: Checksum
-        if: steps.version.outputs.exists == 'false'
+        if: steps.version.outputs.release == 'true'
         shell: bash
         working-directory: release
         run: sha256sum token-usage-dashboard-portable.exe > token-usage-dashboard-portable.exe.sha256
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: steps.version.outputs.exists == 'false'
+        if: steps.version.outputs.release == 'true'
         with:
           name: release-assets
           path: |
@@ -76,7 +79,7 @@ jobs:
   publish:
     # Only this job holds write access; it runs no project code.
     needs: build
-    if: needs.build.outputs.exists == 'false'
+    if: needs.build.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
