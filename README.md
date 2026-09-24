@@ -2,9 +2,9 @@
 
 本機 Electron 儀表板，讀取 Claude Code 與 Codex 的本機 JSONL 使用紀錄，顯示額度、使用量及目前前景終端的 session context。
 
-## 啟動
+## 下載與啟動
 
-執行 `release\token-usage-dashboard-portable.exe`。程式會常駐系統匣；關閉視窗只會隱藏，請由系統匣選擇「結束程式」才會完全關閉。
+從 [Releases](https://github.com/Gp3ShenQ/token-usage-dashboard/releases/latest) 下載 `token-usage-dashboard-portable.exe`，免安裝直接執行；自行打包則執行 `release\token-usage-dashboard-portable.exe`。執行檔未經程式碼簽章，首次執行若出現 Windows SmartScreen，請選「其他資訊 → 仍要執行」。程式會常駐系統匣；關閉視窗只會隱藏，請由系統匣選擇「結束程式」才會完全關閉。
 
 ## 前景終端與 session 自動辨識
 
@@ -73,6 +73,39 @@ npm run build
 ```
 
 `npm run build` 會產生 `release\token-usage-dashboard-portable.exe`。封裝前請關閉正在執行的 Dashboard，否則 Windows 會鎖住 portable 執行檔而無法覆寫。
+
+## 分支與發佈
+
+- `dev`：日常開發。push 後 CI 會執行 typecheck、編譯與單元測試。
+- `main`：只接受由 `dev` 合併（建議透過 PR，CI 通過後再合併）。
+- 合併進 `main` 時，Release workflow 讀取 `package.json` 的 `version`：若 tag `v<version>` 不存在，就測試、打包、建立 tag 並發佈 Release；已存在則略過。因此**只有提升版號才會發佈**，其他合併不會產生新版本。
+
+### 版號規則
+
+採 [Semantic Versioning](https://semver.org/lang/zh-TW/)：`MAJOR.MINOR.PATCH`。
+
+| 變更類型 | 升級 | 範例 |
+| --- | --- | --- |
+| 不相容變更：設定檔格式、session 綁定或交接檔格式改變、需重新執行 `monitor:install`、移除功能 | MAJOR | `1.4.2` → `2.0.0` |
+| 新增功能，舊設定與資料仍可用 | MINOR | `1.4.2` → `1.5.0` |
+| 錯誤修正、效能、文字或樣式調整 | PATCH | `1.4.2` → `1.4.3` |
+| 試用版 | 加上 `-beta.N` | `1.5.0-beta.1`（發佈為 Pre-release） |
+
+- `1.0.0` 之前（`0.y.z`）視為開發期：不相容變更升 MINOR，其餘升 PATCH。
+- 只改文件、CI 或測試不需升版。
+- 已發佈的版號不可重用；發佈有誤時升 PATCH 重新發佈，不刪除或移動既有 tag。
+
+### 發佈步驟
+
+```powershell
+git switch dev
+npm version minor --no-git-tag-version   # 或 patch / major / prerelease --preid beta
+git commit -am "chore(release): v<新版號>"
+git push origin dev
+# 在 GitHub 建立 dev → main 的 PR，CI 通過後合併
+```
+
+不要手動建立 `v*` tag；tag 由 Release workflow 建立。
 
 ## 一次性交接報告（試用）
 

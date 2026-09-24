@@ -1,0 +1,72 @@
+name: Release
+
+# Publishes a release when main carries a package.json version that has no tag yet.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::package.json version '$version' is not valid SemVer"
+            exit 1
+          fi
+          tag="v$version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$tag already exists; skipping release"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+          # A hyphenated version such as 1.2.0-beta.1 is published as a prerelease.
+          if [[ "$version" == *-* ]]; then echo "prerelease=--prerelease" >> "$GITHUB_OUTPUT"; fi
+
+      - uses: actions/setup-node@v4
+        if: steps.version.outputs.exists == 'false'
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Test
+        if: steps.version.outputs.exists == 'false'
+        run: |
+          npm ci
+          npm run typecheck
+          npm run build:main
+          npm run test:monitor
+
+      - name: Build
+        if: steps.version.outputs.exists == 'false'
+        run: npm run build
+
+      - name: Publish release
+        if: steps.version.outputs.exists == 'false'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            release/token-usage-dashboard-portable.exe \
+            --target "$GITHUB_SHA" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --generate-notes ${{ steps.version.outputs.prerelease }}
