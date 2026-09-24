@@ -477,11 +477,11 @@ async function main() {
   backend = await bootstrapServer({ root: path.join(app.getPath("userData"), "handoffs"), token: handoffToken, dispatch: queueCodexHandoff });
   writeStartupLog("backend ready");
   backend.monitor.onComplete((snapshot) => {
-    const title = (snapshot.source === "claude" ? "Claude" : "Codex") + " 本輪回覆已結束";
+    const title = (snapshot.source === "claude" ? "【CLAUDE】" : "【CODEX】") + " 本輪回覆已結束";
     const body = "Session " + snapshot.sessionId.slice(0, 8) + " · 可返回 terminal 查看結果";
     // The portable Windows build has no installer-created Start Menu toast registration.
     if (process.platform === "win32" && tray) {
-      tray.displayBalloon({ title, content: body, iconType: "info", respectQuietTime: true });
+      tray.displayBalloon({ title, content: body, iconType: "none", respectQuietTime: true });
     } else if (Notification.isSupported()) {
       new Notification({ title, body }).show();
     }
