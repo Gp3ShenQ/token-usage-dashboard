@@ -5,19 +5,57 @@ on:
     branches: [dev]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
 
       - run: npm ci
+      - run: node scripts/check-version.mjs
       - run: npm run typecheck
       - run: npm run build:main
       - run: npm run test:monitor
+
+  package:
+    needs: check
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+      # Each native command gets its own step so a failing exit code is never masked.
+      - run: npx electron scripts/check-monitor-ui.cjs --packaged
+      - run: npx electron scripts/check-handoff-records-ui.cjs --packaged
+      - name: Smoke test packaged app
+        run: ./scripts/smoke-packaged.ps1
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: token-usage-dashboard-portable
+          path: release/token-usage-dashboard-portable.exe
+          retention-days: 7

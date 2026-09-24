@@ -79,6 +79,8 @@ npm run build
 - `dev`：日常開發。push 後 CI 會執行 typecheck、編譯與單元測試。
 - `main`：只接受由 `dev` 合併（建議透過 PR，CI 通過後再合併）。
 - 合併進 `main` 時，Release workflow 讀取 `package.json` 的 `version`：若 tag `v<version>` 不存在，就測試、打包、建立 tag 並發佈 Release；已存在則略過。因此**只有提升版號才會發佈**，其他合併不會產生新版本。
+- CI 會實際打包並啟動打包後的程式（UI 檢查與冒煙測試），並以 `scripts/check-version.mjs` 拒絕低於已發佈版本的版號；打包好的 exe 會保留 7 天，可在該次 Actions 執行頁面下載試用。
+- 每個 Release 附有 `.sha256`，下載後可用 `Get-FileHash token-usage-dashboard-portable.exe` 核對。
 
 ### 版號規則
 

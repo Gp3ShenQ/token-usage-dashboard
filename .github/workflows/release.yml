@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release
@@ -16,48 +16,45 @@ concurrency:
 jobs:
   release:
     runs-on: windows-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
       - name: Read version
         id: version
-        shell: bash
-        run: |
-          version=$(node -p "require('./package.json').version")
-          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::package.json version '$version' is not valid SemVer"
-            exit 1
-          fi
-          tag="v$version"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::$tag already exists; skipping release"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-          # A hyphenated version such as 1.2.0-beta.1 is published as a prerelease.
-          if [[ "$version" == *-* ]]; then echo "prerelease=--prerelease" >> "$GITHUB_OUTPUT"; fi
+        run: node scripts/check-version.mjs
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         if: steps.version.outputs.exists == 'false'
         with:
           node-version: 22
           cache: npm
 
-      - name: Test
-        if: steps.version.outputs.exists == 'false'
-        run: |
-          npm ci
-          npm run typecheck
-          npm run build:main
-          npm run test:monitor
+      # Each native command gets its own step so a failing exit code is never masked.
+      - if: steps.version.outputs.exists == 'false'
+        run: npm ci
+      - if: steps.version.outputs.exists == 'false'
+        run: npm run typecheck
+      - if: steps.version.outputs.exists == 'false'
+        run: npm run build:main
+      - if: steps.version.outputs.exists == 'false'
+        run: npm run test:monitor
 
       - name: Build
         if: steps.version.outputs.exists == 'false'
         run: npm run build
+
+      - if: steps.version.outputs.exists == 'false'
+        run: npx electron scripts/check-monitor-ui.cjs --packaged
+      - if: steps.version.outputs.exists == 'false'
+        run: npx electron scripts/check-handoff-records-ui.cjs --packaged
+      - name: Smoke test packaged app
+        if: steps.version.outputs.exists == 'false'
+        run: ./scripts/smoke-packaged.ps1
 
       - name: Publish release
         if: steps.version.outputs.exists == 'false'
@@ -65,8 +62,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          cd release
+          sha256sum token-usage-dashboard-portable.exe > token-usage-dashboard-portable.exe.sha256
           gh release create "${{ steps.version.outputs.tag }}" \
-            release/token-usage-dashboard-portable.exe \
+            token-usage-dashboard-portable.exe \
+            token-usage-dashboard-portable.exe.sha256 \
             --target "$GITHUB_SHA" \
             --title "${{ steps.version.outputs.tag }}" \
             --generate-notes ${{ steps.version.outputs.prerelease }}
