@@ -30,7 +30,8 @@ jobs:
           cache: npm
 
       - run: npm ci
-      - run: node scripts/check-version.mjs
+      - name: Preview next release
+        run: node scripts/release-version.mjs
       - run: npm run typecheck
       - run: npm run build:main
       - run: npm run test:monitor

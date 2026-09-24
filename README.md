@@ -76,38 +76,39 @@ npm run build
 
 ## 分支與發佈
 
-- `dev`：日常開發。push 後 CI 會執行 typecheck、編譯與單元測試。
-- `main`：只接受由 `dev` 合併（建議透過 PR，CI 通過後再合併）。
-- 合併進 `main` 時，Release workflow 讀取 `package.json` 的 `version`：若 tag `v<version>` 不存在，就測試、打包、建立 tag 並發佈 Release；已存在則略過。因此**只有提升版號才會發佈**，其他合併不會產生新版本。
-- CI 會實際打包並啟動打包後的程式（UI 檢查與冒煙測試），並以 `scripts/check-version.mjs` 拒絕低於已發佈版本的版號；打包好的 exe 會保留 7 天，可在該次 Actions 執行頁面下載試用。
+- `dev`：日常開發。push 或開 PR 後，CI 會執行 typecheck、編譯、單元測試，並實際打包、啟動打包後的程式（UI 檢查與冒煙測試）；打包好的 exe 保留 7 天，可在該次 Actions 執行頁面下載試用。
+- `main`：只能透過 `dev` → `main` 的 PR 合併，CI 必須通過。
+- **每次合併進 `main` 都會自動發佈**：Release workflow 依 commit 訊息計算新版號，測試、打包後建立 tag 與 Release。不需手動改版號或建立 tag。
 - 每個 Release 附有 `.sha256`，下載後可用 `Get-FileHash token-usage-dashboard-portable.exe` 核對。
 
 ### 版號規則
 
-採 [Semantic Versioning](https://semver.org/lang/zh-TW/)：`MAJOR.MINOR.PATCH`。
+採 [Semantic Versioning](https://semver.org/lang/zh-TW/)（`MAJOR.MINOR.PATCH`），由 `scripts/release-version.mjs` 依上次發佈後的 commit 訊息（[Conventional Commits](https://www.conventionalcommits.org/zh-hant/)）自動決定，取其中最高的一級：
 
-| 變更類型 | 升級 | 範例 |
+| commit 訊息 | 升級 | 範例 |
 | --- | --- | --- |
-| 不相容變更：設定檔格式、session 綁定或交接檔格式改變、需重新執行 `monitor:install`、移除功能 | MAJOR | `1.4.2` → `2.0.0` |
-| 新增功能，舊設定與資料仍可用 | MINOR | `1.4.2` → `1.5.0` |
-| 錯誤修正、效能、文字或樣式調整 | PATCH | `1.4.2` → `1.4.3` |
-| 試用版 | 加上 `-beta.N` | `1.5.0-beta.1`（發佈為 Pre-release） |
+| `feat!:`、`fix!:` 等帶 `!`，或內文含 `BREAKING CHANGE:` | MAJOR | `1.4.2` → `2.0.0` |
+| `feat:` | MINOR | `1.4.2` → `1.5.0` |
+| 其他（`fix`、`refactor`、`perf`、`docs`、`ci`、`test`、`chore` 等） | PATCH | `1.4.2` → `1.4.3` |
 
-- `1.0.0` 之前（`0.y.z`）視為開發期：不相容變更升 MINOR，其餘升 PATCH。
-- 只改文件、CI 或測試不需升版。
-- 已發佈的版號不可重用；發佈有誤時升 PATCH 重新發佈，不刪除或移動既有 tag。
+- 不相容變更包含：設定檔、session 綁定或交接檔格式改變、需重新執行 `monitor:install`、移除功能；這類 commit 請加 `!`。
+- `1.0.0` 之前（`0.y.z`）視為開發期：不相容變更只升 MINOR。
+- 版號以 tag 為準；`package.json` 的 `version` 只在打包時由 workflow 寫入，不會提交回 repo。
+- 要指定特定版號（例如 `1.0.0` 或試用版 `1.5.0-beta.1`），在 `dev` 把 `package.json` 的 `version` 改成比最新 tag 高的值再合併；帶 `-` 的版號發佈為 Pre-release，之後的下一次合併會發佈對應的正式版。
+- 已發佈的版號不可重用；發佈有誤就再合併一次修正，發佈新的 PATCH，不刪除或移動既有 tag。
+- 不要手動建立 `v*` tag。
 
 ### 發佈步驟
 
+1. 在 `dev` 完成並 push，確認 CI 通過（Actions 的「Preview next release」步驟會顯示合併後的版號）。
+2. 在 GitHub 建立 `dev` → `main` 的 PR，以「建立合併提交」合併。
+3. 合併後同步 `dev`，避免下次 PR 落後：
+
 ```powershell
 git switch dev
-npm version minor --no-git-tag-version   # 或 patch / major / prerelease --preid beta
-git commit -am "chore(release): v<新版號>"
+git pull origin main
 git push origin dev
-# 在 GitHub 建立 dev → main 的 PR，CI 通過後合併
 ```
-
-不要手動建立 `v*` tag；tag 由 Release workflow 建立。
 
 ## 一次性交接報告（試用）
 
