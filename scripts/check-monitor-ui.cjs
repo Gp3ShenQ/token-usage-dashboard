@@ -38,6 +38,15 @@ const waitForText = async (selector, expected) => window.webContents.executeJava
     check();
   })`);
 function check(name, condition) { if (!condition) throw new Error(name); results.push(name); }
+async function readMascotPose() {
+  return window.webContents.executeJavaScript(`(() => {
+    const mascot = document.querySelector(".agent-mascot");
+    const style = selector => { const element = mascot.querySelector(selector); return element ? getComputedStyle(element) : null; };
+    const pose = { eyes:style(".clawd-eyes")?.transform, feet:style(".clawd-feet-a")?.transform,
+      arm:style(".clawd-arm")?.transform, sprite:style(".codey")?.backgroundPosition };
+    return pose;
+  })()`);
+}
 async function checkHandoffThreshold() {
   for (const percent of [null, 43.2, 72, 72.1, 72, 73]) {
     data.contextPercent = percent;
@@ -104,8 +113,28 @@ app.whenReady().then(async () => {
   const url = pathToFileURL(path.join(appRoot, "dist/widget.html"));
   url.search = new URLSearchParams({ agent:"claude", session:sessionId, overlay:"1", handoffToken:"fixture-token" }).toString();
   await window.loadURL(url.href);
+  window.webContents.debugger.attach("1.3");
+  await window.webContents.debugger.sendCommand("Emulation.setEmulatedMedia", { features: [{ name:"prefers-reduced-motion", value:"no-preference" }] });
   await waitForText(".session-status", "執行中");
   await waitForText(".task-label-value", "相容驗證");
+  check("Claude replaces the dot with animated Clawd beside its name", await window.webContents.executeJavaScript('!!document.querySelector(".stack-title strong + .agent-mascot.claude.running svg") && !document.querySelector(".stack-title .dot") && document.querySelector(".clawd-body").getAnimations().length > 0'));
+  const clawdWorkingPose = await readMascotPose();
+  await window.webContents.debugger.sendCommand("Emulation.setEmulatedMedia", { features: [{ name:"prefers-reduced-motion", value:"reduce" }] });
+  check("working Clawd keeps whole-body and both-arm animation in reduced motion", await window.webContents.executeJavaScript('document.querySelector(".clawd-body").getAnimations().length === 1 && Array.from(document.querySelectorAll(".clawd-arm")).every(arm => arm.getAnimations().length === 1)'));
+  check("working Clawd visibly moves its whole body by at least two pixels", await window.webContents.executeJavaScript(`new Promise((resolve, reject) => {
+    const body = document.querySelector(".clawd-body");
+    let minimum = body.getBoundingClientRect().y, maximum = minimum;
+    const deadline = performance.now() + 2000;
+    const sample = () => {
+      const y = body.getBoundingClientRect().y;
+      minimum = Math.min(minimum, y); maximum = Math.max(maximum, y);
+      if (maximum - minimum >= 2) return resolve(true);
+      if (performance.now() >= deadline) return reject(new Error("Clawd body did not visibly move"));
+      requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+  })`));
+  await window.webContents.debugger.sendCommand("Emulation.setEmulatedMedia", { features: [{ name:"prefers-reduced-motion", value:"no-preference" }] });
   check("Claude model and effort are visible", await window.webContents.executeJavaScript('document.querySelector(".session-model").textContent.includes("Claude Opus 4.6") && document.querySelector(".session-model").textContent.includes("high")'));
   check("all metrics fit within the fixed overlay", await window.webContents.executeJavaScript('document.querySelector(".session-health").getBoundingClientRect().bottom <= innerHeight && document.documentElement.scrollWidth <= innerWidth'));
   await checkHandoffThreshold();
@@ -133,10 +162,23 @@ app.whenReady().then(async () => {
   fs.writeFileSync(path.join(output, "claude.png"), (await window.webContents.capturePage()).toPNG());
   data.status = "waiting_approval"; push();
   await waitForText(".session-status", "等待授權");
+  check("Clawd changes animation when waiting for approval", await window.webContents.executeJavaScript('!!document.querySelector(".agent-mascot.claude.waiting") && getComputedStyle(document.querySelector(".clawd-body")).animationName.includes("clawd-look")'));
+  await window.webContents.debugger.sendCommand("Emulation.setEmulatedMedia", { features: [{ name:"prefers-reduced-motion", value:"reduce" }] });
+  check("reduced motion keeps Clawd approval visible with blinking and no body movement", await window.webContents.executeJavaScript('document.querySelector(".clawd-body").getAnimations().length === 0 && document.querySelector(".clawd-eyes").getAnimations().length === 1 && getComputedStyle(document.querySelector(".clawd-eyes")).animationDuration === "3s"'));
+  check("waiting Clawd raises its arms even with reduced motion", (await readMascotPose()).arm !== clawdWorkingPose.arm);
+  await window.webContents.debugger.sendCommand("Emulation.setEmulatedMedia", { features: [{ name:"prefers-reduced-motion", value:"no-preference" }] });
   check("event push updates approval without quota polling", true);
+  data.status = "idle"; push();
+  await waitForText(".session-status", "閒置");
+  check("idle Clawd rests instead of stepping", await window.webContents.executeJavaScript('!!document.querySelector(".agent-mascot.claude.resting") && document.querySelector(".clawd-body").getAnimations().length === 0 && getComputedStyle(document.querySelector(".clawd-eyes")).animationName.includes("clawd-rest")'));
+  const clawdRestingPose = await readMascotPose();
+  check("idle Clawd has visibly different eyes and tucked feet", clawdRestingPose.eyes !== clawdWorkingPose.eyes && clawdRestingPose.feet !== clawdWorkingPose.feet);
+  await window.webContents.executeJavaScript("new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))");
+  fs.writeFileSync(path.join(output, "claude-idle.png"), (await window.webContents.capturePage()).toPNG());
   data.status = "interrupted"; data.turnEndedAt = new Date().toISOString(); push();
   await waitForText(".session-status", "已中斷");
   check("interrupt status is rendered", true);
+  check("interrupted Clawd stops animating", await window.webContents.executeJavaScript('!!document.querySelector(".agent-mascot.stopped") && document.querySelector(".clawd").getAnimations({ subtree:true }).length === 0'));
   data.readError = true; push();
   await waitForText(".session-health", "紀錄讀取異常");
   check("read failures are visible", true);
@@ -145,6 +187,28 @@ app.whenReady().then(async () => {
   url.search = new URLSearchParams({ agent:"codex", session:sessionId, overlay:"1", handoffToken:"fixture-token" }).toString();
   await window.loadURL(url.href);
   await waitForText(".session-status", "閒置");
+  check("Codex displays local Codey and blinks while idle", await window.webContents.executeJavaScript('!!document.querySelector(".agent-mascot.codex.resting .codey") && getComputedStyle(document.querySelector(".codey")).backgroundImage.includes("codey-spritesheet.webp") && getComputedStyle(document.querySelector(".codey")).animationName.includes("codey-rest")'));
+  const codeyRestingPose = await readMascotPose();
+  check("idle Codey uses the closed-eye resting frame", codeyRestingPose.sprite.startsWith("14.2857%"));
+  await window.webContents.executeJavaScript("new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))");
+  fs.writeFileSync(path.join(output, "codex-idle.png"), (await window.webContents.capturePage()).toPNG());
+  check("Codey sprite loads offline", await window.webContents.executeJavaScript('new Promise(resolve => { const image = new Image(); image.onload = () => resolve(image.naturalWidth === 1536 && image.naturalHeight === 1872); image.onerror = () => resolve(false); image.src = new URL("codey-spritesheet.webp", location.href).href; })'));
+  data.status = "running"; push();
+  await waitForText(".session-status", "執行中");
+  check("Codey animates the working sprite row", await window.webContents.executeJavaScript('!!document.querySelector(".agent-mascot.codex.running") && getComputedStyle(document.querySelector(".codey")).getPropertyValue("--sprite-row").trim() === "87.5%" && document.querySelector(".codey").getAnimations().length === 1'));
+  check("working Codey uses a visibly different pose from idle", (await readMascotPose()).sprite !== codeyRestingPose.sprite);
+  data.status = "idle"; push();
+  await waitForText(".session-status", "閒置");
+  check("Codey returns to its idle animation when work ends", await window.webContents.executeJavaScript('!!document.querySelector(".agent-mascot.resting") && getComputedStyle(document.querySelector(".codey")).animationName.includes("codey-rest")'));
+  await window.webContents.debugger.sendCommand("Emulation.setEmulatedMedia", { features: [{ name:"prefers-reduced-motion", value:"reduce" }] });
+  check("reduced motion preserves Codey idle blinking", await window.webContents.executeJavaScript('document.querySelector(".codey").getAnimations().length === 1 && getComputedStyle(document.querySelector(".codey")).animationDuration === "6s"'));
+  data.status = "waiting_approval"; push();
+  await waitForText(".session-status", "等待授權");
+  check("reduced motion slows Codey approval animation instead of stopping it", await window.webContents.executeJavaScript('!!document.querySelector(".agent-mascot.waiting") && document.querySelector(".codey").getAnimations().length === 1 && getComputedStyle(document.querySelector(".codey")).animationDuration === "4.8s"'));
+  data.status = "running"; push();
+  await waitForText(".session-status", "執行中");
+  check("reduced motion slows Codey working animation instead of stopping it", await window.webContents.executeJavaScript('!!document.querySelector(".agent-mascot.running") && getComputedStyle(document.querySelector(".codey")).animationDuration === "2.4s"'));
+  await window.webContents.debugger.sendCommand("Emulation.setEmulatedMedia", { features: [{ name:"prefers-reduced-motion", value:"no-preference" }] });
   await waitForText(".task-label-value", "相容驗證");
   check("Codex context is labeled approximate", await window.webContents.executeJavaScript('document.querySelector(".session-context").textContent.includes("≈")'));
   check("long model fits without horizontal overflow", await window.webContents.executeJavaScript('Array.from(document.querySelectorAll(".single-agent-card, .session-status, .session-health, .session-row strong")).every(element => element.getBoundingClientRect().right <= innerWidth)'));
@@ -161,6 +225,7 @@ app.whenReady().then(async () => {
   fs.writeFileSync(path.join(output, "codex.png"), (await window.webContents.capturePage()).toPNG());
   for (const stream of streams) stream.end();
   await waitForText(".session-status", "連線中斷");
+  check("disconnected Codey stops its working animation", await window.webContents.executeJavaScript('!!document.querySelector(".agent-mascot.codex.unavailable") && document.querySelector(".codey").getAnimations().length === 0'));
   check("disconnection is visible", true);
   check("no renderer errors", errors.length === 0);
   await finish();
