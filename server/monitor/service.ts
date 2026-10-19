@@ -3,6 +3,7 @@ import path from "node:path";
 import os from "node:os";
 import { SessionMonitorState, type AgentSource, type MonitorResult, type MonitorSnapshot } from "./state.js";
 import { JsonlTail } from "./tail.js";
+import { readClaudeShellExecutions, type ClaudeShellExecution } from "./execution.js";
 
 type SourceFile = { path: string; kind: "log" | "hook"; source: AgentSource; sessionId: string };
 type Cursor = { tail: JsonlTail; inode: number; size: number; modifiedAt: number; malformed: boolean };
@@ -16,7 +17,8 @@ type SessionEntry = {
   notifiedTurn: string | null;
   lastAccessAt: number;
 };
-type MonitorOptions = { claudeRoot?: string; codexRoot?: string; eventRoot?: string };
+type MonitorOptions = { claudeRoot?: string; codexRoot?: string; eventRoot?: string;
+  executionProbe?: () => Promise<ClaudeShellExecution[]> };
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const SESSION_IDLE_TTL_MS = 5 * 60_000;
 
@@ -30,9 +32,13 @@ export class SessionMonitorService {
   private completions = new Set<(snapshot: MonitorSnapshot) => void>();
   private closed = false;
   private recoveryTimer?: NodeJS.Timeout;
+  private executionTimer?: NodeJS.Timeout;
+  private executionJob?: Promise<void>;
+  private executionProbe: () => Promise<ClaudeShellExecution[]>;
   private startedAt = Date.now();
 
   constructor(options: MonitorOptions = {}) {
+    this.executionProbe = options.executionProbe ?? readClaudeShellExecutions;
     const home = os.homedir();
     this.roots = [
       { path: options.claudeRoot ?? path.join(home, ".claude", "projects"), kind: "log", source: "claude" },
@@ -45,6 +51,8 @@ export class SessionMonitorService {
     // Only the HUD-owned telemetry directory may be created.
     await fs.promises.mkdir(this.roots[2].path, { recursive: true });
     await this.discover();
+    this.executionTimer = setInterval(() => { void this.refreshExecutions(); }, 2000);
+    this.executionTimer.unref();
     this.recoveryTimer = setInterval(() => {
       void this.discover().then(() => {
         for (const [key, entry] of this.sessions) {
@@ -132,6 +140,28 @@ export class SessionMonitorService {
   }
 
   private emit() { for (const listener of this.listeners) listener(); }
+
+  private refreshExecutions(): Promise<void> {
+    if (this.closed) return Promise.resolve();
+    if (this.executionJob) return this.executionJob;
+    const pending = [...this.sessions.values()].flatMap(entry => {
+      const approval = entry.state.pendingShellApproval();
+      return approval ? [{ entry, approval }] : [];
+    });
+    if (!pending.length) return Promise.resolve();
+    this.executionJob = (async () => {
+      try {
+        const executions = await this.executionProbe();
+        if (this.closed) return;
+        for (const { entry, approval } of pending) {
+          const execution = executions.find(record => record.sessionId.toLowerCase() === entry.state.data.sessionId.toLowerCase() &&
+            Date.parse(record.startedAt) >= Date.parse(approval.requestedAt));
+          if (execution && entry.state.confirmShellExecution(approval, execution.startedAt)) this.emit();
+        }
+      } catch { /* Unconfirmed execution must not clear a real permission prompt. */ }
+    })().finally(() => { this.executionJob = undefined; });
+    return this.executionJob;
+  }
 
   private refresh(key: string): Promise<void> {
     const entry = this.sessions.get(key);
@@ -221,9 +251,11 @@ export class SessionMonitorService {
   async close() {
     this.closed = true;
     if (this.recoveryTimer) clearInterval(this.recoveryTimer);
+    if (this.executionTimer) clearInterval(this.executionTimer);
     for (const watcher of this.watchers.values()) watcher.close();
     for (const entry of this.sessions.values()) if (entry.notification) clearTimeout(entry.notification);
     await Promise.all([...this.sessions.values()].map(entry => entry.job));
+    await this.executionJob;
     this.listeners.clear();
     this.completions.clear();
   }

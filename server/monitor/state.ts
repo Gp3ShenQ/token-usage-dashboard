@@ -50,6 +50,8 @@ export class SessionMonitorState {
   private effortAt = "";
   private contextAt = "";
   private waitingTools = new Map<string, RunStatus>();
+  private activeToolNames = new Map<string, string>();
+  private shellApproval: { toolKey: string; requestedAt: string } | null = null;
   private pendingTurnHooks = new Map<string, MonitorRecord[]>();
 
   constructor(source: AgentSource, sessionId: string) {
@@ -69,7 +71,11 @@ export class SessionMonitorState {
     if (this.data.statusAt && timestamp < this.data.statusAt) return;
     // Repeated stop events must not move the turn's end or create another notification.
     if (this.data.status === status && terminalStatuses.includes(status)) return;
-    if (terminalStatuses.includes(status)) this.waitingTools.clear();
+    if (terminalStatuses.includes(status)) {
+      this.waitingTools.clear();
+      this.activeToolNames.clear();
+      this.shellApproval = null;
+    }
     this.data.status = status;
     this.data.statusAt = timestamp;
     this.data.turnEndedAt = terminalStatuses.includes(status) ? timestamp : null;
@@ -90,6 +96,8 @@ export class SessionMonitorState {
     if (this.data.turnStartedAt && timestamp < this.data.turnStartedAt) return;
     if (turnId !== this.data.turnId) {
       this.waitingTools.clear();
+      this.activeToolNames.clear();
+      this.shellApproval = null;
       this.data.turnId = turnId;
       this.data.turnStartedAt = timestamp;
       this.codexBaseline = this.codexTotal;
@@ -144,14 +152,15 @@ export class SessionMonitorState {
     }
     if (record.model) this.model(record.model, timestamp);
     if (this.data.statusAt && timestamp < this.data.statusAt) return;
-    const toolKey = record.toolUseId ?? record.toolName ?? "pending-tool";
-    const refreshToolStatus = () => this.status(
-      [...this.waitingTools.values()].includes("waiting_approval") ? "waiting_approval" :
-      this.waitingTools.size ? "waiting_input" : "running", timestamp);
+    const matchingToolIds = record.toolName
+      ? [...this.activeToolNames].filter(([, name]) => name === record.toolName).map(([id]) => id) : [];
+    const toolKey = record.toolUseId ?? (matchingToolIds.length === 1 ? matchingToolIds[0] : record.toolName ?? "pending-tool");
     switch (record.event) {
       case "SessionStart":
         if (!this.data.statusAt || timestamp >= this.data.statusAt) {
           this.waitingTools.clear();
+          this.activeToolNames.clear();
+          this.shellApproval = null;
           this.data.turnId = null;
           this.data.turnStartedAt = null;
           this.data.turnTokens = null;
@@ -165,18 +174,27 @@ export class SessionMonitorState {
         break;
       case "PermissionRequest":
         this.waitingTools.set(toolKey, "waiting_approval");
-        refreshToolStatus();
+        if (record.toolName === "Bash") this.shellApproval = { toolKey, requestedAt: timestamp };
+        this.refreshToolStatus(timestamp);
         break;
       case "PreToolUse":
+        if (record.toolUseId && record.toolName) this.activeToolNames.set(record.toolUseId, record.toolName);
         if (/AskUserQuestion|request_user_input/.test(record.toolName ?? "")) this.waitingTools.set(toolKey, "waiting_input");
         if (/ExitPlanMode/.test(record.toolName ?? "")) this.waitingTools.set(toolKey, "waiting_approval");
-        refreshToolStatus();
+        this.refreshToolStatus(timestamp);
         break;
       case "PostToolUse":
       case "PostToolUseFailure":
-        if (!record.toolUseId && !record.toolName) this.waitingTools.clear();
-        else this.waitingTools.delete(toolKey);
-        refreshToolStatus();
+        if (!record.toolUseId && !record.toolName) {
+          this.waitingTools.clear();
+          this.activeToolNames.clear();
+        } else {
+          this.waitingTools.delete(toolKey);
+          this.activeToolNames.delete(toolKey);
+          // An approval without an id can cover concurrent tools with the same name.
+          if (record.toolName && ![...this.activeToolNames.values()].includes(record.toolName)) this.waitingTools.delete(record.toolName);
+        }
+        this.refreshToolStatus(timestamp);
         break;
       case "Stop":
         if (this.data.source === "claude" && !["interrupted", "error", "ended"].includes(this.data.status)) this.status("idle", timestamp);
@@ -185,6 +203,31 @@ export class SessionMonitorState {
       case "StopFailure": this.status("error", timestamp); break;
       case "SessionEnd": this.status("ended", timestamp); break;
     }
+  }
+
+  private refreshToolStatus(timestamp: string) {
+    this.status([...this.waitingTools.values()].includes("waiting_approval") ? "waiting_approval" :
+      this.waitingTools.size ? "waiting_input" : "running", timestamp);
+  }
+
+  pendingShellApproval() {
+    const approval = this.shellApproval;
+    if (this.data.source !== "claude" || this.data.readError || !approval ||
+        this.waitingTools.get(approval.toolKey) !== "waiting_approval" ||
+        this.activeToolNames.get(approval.toolKey) !== "Bash" ||
+        [...this.activeToolNames.values()].filter(name => name === "Bash").length !== 1) return null;
+    return approval;
+  }
+
+  confirmShellExecution(approval: { toolKey: string; requestedAt: string }, startedAt: string) {
+    const current = this.pendingShellApproval();
+    if (!current || current.toolKey !== approval.toolKey || current.requestedAt !== approval.requestedAt ||
+        !Number.isFinite(Date.parse(startedAt)) || Date.parse(startedAt) < Date.parse(approval.requestedAt)) return false;
+    this.waitingTools.delete(approval.toolKey);
+    this.shellApproval = null;
+    const timestamp = new Date(startedAt).toISOString();
+    this.refreshToolStatus(this.data.statusAt && this.data.statusAt > timestamp ? this.data.statusAt : timestamp);
+    return true;
   }
 
   acceptLog(record: any) {
