@@ -6,6 +6,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { SessionMonitorService } from "../service.js";
 import { registerMonitorRoutes } from "../routes.js";
 import type { MonitorSnapshot } from "../state.js";
+import type { ClaudeShellExecution } from "../execution.js";
 
 const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const cleanup of cleanups.reverse()) await cleanup(); cleanups.length = 0; });
@@ -37,12 +38,12 @@ it("releases an unobserved idle session and rebuilds it without replaying comple
   } finally { vi.useRealTimers(); }
 });
 
-async function fixture() {
+async function fixture(executionProbe: () => Promise<ClaudeShellExecution[]> = async () => []) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "hud-monitor-"));
   cleanups.push(() => fs.rm(root, { recursive: true, force: true }));
   const options = { claudeRoot: path.join(root, "claude"), codexRoot: path.join(root, "codex"), eventRoot: path.join(root, "events") };
   for (const directory of Object.values(options)) await fs.mkdir(directory);
-  const service = new SessionMonitorService(options);
+  const service = new SessionMonitorService({ ...options, executionProbe });
   cleanups.push(() => service.close());
   return { service, options, root };
 }
@@ -63,6 +64,42 @@ it("keeps sources isolated and rejects ambiguous session prefixes", async () => 
   expect((await service.get("codex", "12345678")).state).toBe("ready");
   expect(await service.get("claude", "../escape")).toEqual({ state: "pending" });
   expect(await service.get("claude", "99999999")).toEqual({ state: "pending" });
+});
+
+it("pushes running status when the matching Claude shell starts, before a completion hook", async () => {
+  let executions: ClaudeShellExecution[] = [];
+  const probe = vi.fn(async () => executions);
+  const { service, options } = await fixture(probe);
+  const start = Date.now() - 10_000;
+  const records = [
+    { event:"UserPromptSubmit", timestamp:new Date(start).toISOString() },
+    { event:"PreToolUse", timestamp:new Date(start + 1000).toISOString(), toolName:"Bash", toolUseId:"bash-1" },
+    { event:"PermissionRequest", timestamp:new Date(start + 2000).toISOString(), toolName:"Bash" },
+  ].map((record, index) => line({ source:"claude", sessionId:id, eventId:String(index), ...record })).join("");
+  await fs.writeFile(path.join(options.eventRoot, "claude-" + id + ".events.jsonl"), records);
+  vi.useFakeTimers({ toFake:["setInterval", "clearInterval"] });
+  try {
+    await service.start();
+    expect((await snapshot(service)).status).toBe("waiting_approval");
+    await vi.advanceTimersByTimeAsync(2000);
+    expect((await snapshot(service)).status).toBe("waiting_approval");
+    executions = [{ sessionId:otherId, startedAt:new Date(start + 3000).toISOString() },
+      { sessionId:id, startedAt:new Date(start).toISOString() }];
+    await vi.advanceTimersByTimeAsync(2000);
+    expect((await snapshot(service)).status).toBe("waiting_approval");
+    probe.mockRejectedValueOnce(new Error("Process query unavailable"));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect((await snapshot(service)).status).toBe("waiting_approval");
+    const updates = vi.fn();
+    service.subscribe(updates);
+    executions = [{ sessionId:id, startedAt:new Date(start + 3000).toISOString() }];
+    await vi.advanceTimersByTimeAsync(2000);
+    expect((await snapshot(service)).status).toBe("running");
+    expect(updates).toHaveBeenCalled();
+    const calls = probe.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(probe).toHaveBeenCalledTimes(calls);
+  } finally { await service.close(); vi.useRealTimers(); }
 });
 
 it("updates on append, keeps incomplete lines pending and resets truncated logs", async () => {

@@ -7,6 +7,8 @@ contextBridge.exposeInMainWorld("tokenHud", {
   openDashboard: () => ipcRenderer.invoke("app:open-dashboard"),
   minimizeToTray: () => ipcRenderer.invoke("app:minimize-widget"),
   launchAgentTerminal: (agent: "codex" | "claude") => ipcRenderer.invoke("terminal:launch-agent", agent),
+  approveTerminal: (request: { hwnd: string; agent: "codex" | "claude"; sessionId: string; turnId: string }) =>
+    ipcRenderer.invoke("terminal:approve", request),
 });
 
 window.addEventListener("DOMContentLoaded", () => {

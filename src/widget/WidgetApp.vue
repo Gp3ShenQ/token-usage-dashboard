@@ -12,6 +12,9 @@ const searchParams = new URLSearchParams(window.location.search);
 const currentAgent = ref<AgentKind>(searchParams.get("agent") === "claude" ? "claude" : "codex");
 const isOverlay = searchParams.get("overlay") === "1";
 const sessionPrefix = searchParams.get("session") ?? "";
+const terminalHwnd = searchParams.get("hwnd") ?? "";
+const isMatchingTerminalSession = (sessionId: string) => !!sessionPrefix &&
+  sessionId.toLowerCase().startsWith(sessionPrefix.toLowerCase());
 const directTaskLabel = null;
 
 const fixedOpacity = 0.3;
@@ -32,6 +35,14 @@ const now = ref(Date.now());
 const quotaError = ref(false);
 const monitor = computed(() => monitorResult.value.state === "ready" ? monitorResult.value.data : null);
 const live = computed(() => connected.value && now.value - lastMessageAt.value < 35_000);
+const mascotState = computed(() => {
+  if (!sessionPrefix || !live.value || !monitor.value || monitor.value.readError) return "unavailable";
+  const status = monitor.value.status;
+  if (status === "running") return "running";
+  if (status === "waiting_input" || status === "waiting_approval") return "waiting";
+  if (status === "idle") return "resting";
+  return "stopped";
+});
 const statusText = computed(() => {
   if (!sessionPrefix) return "未綁定";
   if (monitorResult.value.state === "ambiguous") return "識別不唯一";
@@ -51,6 +62,8 @@ const handoffNotice = ref("");
 let handoffTimer: number | null = null;
 let handoffLoading = false;
 let handoffStatusFailed = false;
+let lastApprovedPrompt = "";
+let approvalInProgress = false;
 const HANDOFF_ACTIVE_POLL_MS = 2000;
 const HANDOFF_IDLE_POLL_MS = 30_000;
 const isExactSession = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sessionPrefix);
@@ -148,11 +161,32 @@ function connectMonitor() {
       monitorResult.value = JSON.parse(event.data) as MonitorResult;
       connected.value = true;
       lastMessageAt.value = Date.now();
+      void approveCurrentTerminalPrompt();
     } catch { connected.value = false; }
   };
   stream.onerror = () => { connected.value = false; };
 }
 
+async function approveCurrentTerminalPrompt() {
+  const snapshot = monitorResult.value;
+  if (!isOverlay || !terminalHwnd || snapshot.state !== "ready" || snapshot.data.status !== "waiting_approval" ||
+    snapshot.data.readError || !snapshot.data.turnId || !isMatchingTerminalSession(snapshot.data.sessionId) || !window.tokenHud?.approveTerminal) return;
+
+  const approvalKey = `${snapshot.data.sessionId}:${snapshot.data.turnId}`;
+  if (approvalKey === lastApprovedPrompt || approvalInProgress) return;
+  approvalInProgress = true;
+  try {
+    const result = await window.tokenHud.approveTerminal({
+      hwnd: terminalHwnd,
+      agent: currentAgent.value,
+      sessionId: snapshot.data.sessionId,
+      turnId: snapshot.data.turnId,
+    });
+    if (result.ok) lastApprovedPrompt = approvalKey;
+  } finally {
+    approvalInProgress = false;
+  }
+}
 const panelStyle = computed(() => ({
   "--widget-alpha": `${fixedOpacity}`,
 }));
@@ -257,8 +291,22 @@ onBeforeUnmount(() => {
       <section class="stack-card single-agent-card" :class="cardClass">
         <div class="stack-head" :class="{ 'widget-handle': !isOverlay }">
           <div class="stack-title">
-            <span class="dot" :class="currentAgent"></span>
             <strong>{{ titleText }}</strong>
+            <span class="agent-mascot" :class="[currentAgent, mascotState]" aria-hidden="true">
+              <svg v-if="currentAgent === 'claude'" class="clawd" viewBox="0 0 32 32" shape-rendering="crispEdges">
+                <g class="clawd-body" fill="#D97757">
+                  <path d="M6 7h20v3h3v12h-3v3H6v-3H3V10h3z" />
+                  <path class="clawd-arm clawd-arm-left" d="M0 14h4v7H0z" />
+                  <path class="clawd-arm clawd-arm-right" d="M28 14h4v7h-4z" />
+                  <path class="clawd-feet-a" d="M6 24h4v6H6zM22 24h4v6h-4z" />
+                  <path class="clawd-feet-b" d="M12 24h3v5h-3zM17 24h3v5h-3z" />
+                  <g class="clawd-eyes" fill="#2f2a24"><path d="M9 13h3v6H9zM20 13h3v6h-3z" /></g>
+                </g>
+              </svg>
+              <!-- Official Codey sheet: 8 columns, 9 rows of 192 × 208 frames.
+                   Source: https://learn.chatgpt.com/images/codex/app/pets/codex-spritesheet.webp -->
+              <span v-else class="codey"></span>
+            </span>
           </div>
           <span class="session-status" role="status">{{ statusText }}</span>
           <button v-if="!isOverlay" class="close-button" type="button" title="最小化至系統匣" @click="closeWidget">
@@ -346,6 +394,58 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.agent-mascot { display: inline-flex; flex: 0 0 28px; width: 28px; height: 31px; align-items: center; justify-content: center; pointer-events: none; }
+.clawd { width: 28px; height: 28px; overflow: visible; }
+.clawd-body, .clawd-eyes, .clawd-arm { transform-box: fill-box; transform-origin: center; }
+.clawd-feet-a, .clawd-feet-b { transform-box: fill-box; transform-origin: top; }
+.running .clawd-body { animation: clawd-step 0.8s ease-in-out infinite; }
+.running .clawd-arm { animation: clawd-arm-swing 0.8s ease-in-out infinite; }
+.running .clawd-arm-right { animation-delay: -0.4s; }
+.running .clawd-feet-a { animation: clawd-feet 0.6s steps(2, end) infinite; }
+.running .clawd-feet-b { animation: clawd-feet 0.6s steps(2, end) -0.3s infinite; }
+.waiting .clawd-body { animation: clawd-look 2s ease-in-out infinite; }
+.waiting .clawd-arm { transform: translateY(-3px); animation: clawd-wave 1s steps(2, end) infinite; }
+.resting .clawd-body { transform: translateY(1px); }
+.resting .clawd-feet-a, .resting .clawd-feet-b { transform: scaleY(0.55); }
+.resting .clawd-eyes { animation: clawd-rest 5s steps(1, end) infinite; }
+.unavailable { opacity: 0.5; }
+.codey { display: block; width: 28px; height: calc(28px * 208 / 192); background: url("/codey-spritesheet.webp") no-repeat 0 0 / 800% 900%; image-rendering: pixelated; }
+.running .codey { --sprite-row: 87.5%; animation: codey-frames 1.2s steps(6, end) infinite; }
+.waiting .codey { --sprite-row: 75%; animation: codey-frames 2.4s steps(6, end) infinite; }
+.resting .codey { animation: codey-rest 6s steps(1, end) infinite; }
+@keyframes codey-rest {
+  0%, 86%, 95%, 100% { background-position: 14.2857143% 0; }
+  88%, 92% { background-position: 0 0; }
+}
+@keyframes clawd-rest { 0%, 88%, 94%, 100% { transform: scaleY(0.25); } 90%, 92% { transform: scaleY(0.06); } }
+@keyframes clawd-blink {
+  0%, 88%, 94%, 100% { transform: scaleY(1); }
+  90%, 92% { transform: scaleY(0.12); }
+}
+@keyframes codey-frames {
+  from { background-position: 0 var(--sprite-row); }
+  to { background-position: 85.7142857% var(--sprite-row); }
+}
+@keyframes clawd-step {
+  0%, 100% { transform: translate(-1px, 1px) rotate(-10deg) scaleY(0.94); }
+  25% { transform: translateY(-2px) scaleY(1.03); }
+  50% { transform: translate(1px, 1px) rotate(10deg) scaleY(0.94); }
+  75% { transform: translateY(-4px) scaleY(1.03); }
+}
+@keyframes clawd-arm-swing { 0%, 100% { transform: translateY(1px) rotate(-30deg); } 50% { transform: translateY(-3px) rotate(30deg); } }
+@keyframes clawd-feet { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-2px); } }
+@keyframes clawd-wave { 0%, 100% { transform: translateY(-3px); } 50% { transform: translateY(-5px); } }
+@keyframes clawd-look { 0%, 100% { transform: rotate(-6deg); } 50% { transform: rotate(6deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .waiting .clawd-body, .waiting .clawd-arm { animation: none !important; }
+  .running .clawd-body, .running .clawd-arm { animation-duration: 1.2s; }
+  .running .clawd-arm-right { animation-delay: -0.6s; }
+  .running .clawd-feet-a, .running .clawd-feet-b { animation-duration: 1.2s; }
+  .running .clawd-eyes { animation: clawd-blink 1.8s steps(1, end) infinite; }
+  .waiting .clawd-eyes { animation: clawd-blink 3s steps(1, end) infinite; }
+  .running .codey { animation-duration: 2.4s; }
+  .waiting .codey { animation-duration: 4.8s; }
+}
 .single-agent-card { gap: 7px; min-width: 0; grid-template-columns: minmax(0, 1fr); }
 .session-model { min-width: 0; }
 .session-status { font-size: 10px; color: var(--muted); white-space: nowrap; }

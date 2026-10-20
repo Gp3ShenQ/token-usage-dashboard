@@ -137,12 +137,102 @@ it("keeps a pending question visible when a parallel tool completes", () => {
   expect(state.data.status).toBe("running");
 });
 
+it.each(["PostToolUse", "PostToolUseFailure"])("clears a Claude approval without a tool id after %s", event => {
+  const state = new SessionMonitorState("claude", "session-one");
+  state.acceptHook(hook("UserPromptSubmit", 1));
+  state.acceptHook(hook("PreToolUse", 2, { toolName: "Bash", toolUseId: "bash-1" }));
+  state.acceptHook(hook("PermissionRequest", 3, { toolName: "Bash" }));
+  expect(state.data.status).toBe("waiting_approval");
+  state.acceptHook(hook(event, 4, { toolName: "Bash", toolUseId: "bash-1" }));
+  expect(state.data.status).toBe("running");
+});
+
+it("does not clear another tool's approval when a parallel tool completes", () => {
+  const state = new SessionMonitorState("claude", "session-one");
+  state.acceptHook(hook("UserPromptSubmit", 1));
+  state.acceptHook(hook("PreToolUse", 2, { toolName: "Bash", toolUseId: "bash-1" }));
+  state.acceptHook(hook("PermissionRequest", 3, { toolName: "Bash" }));
+  state.acceptHook(hook("PreToolUse", 4, { toolName: "Read", toolUseId: "read-1" }));
+  state.acceptHook(hook("PostToolUse", 5, { toolName: "Read", toolUseId: "read-1" }));
+  expect(state.data.status).toBe("waiting_approval");
+  state.acceptHook(hook("PostToolUse", 6, { toolName: "Bash", toolUseId: "bash-1" }));
+  expect(state.data.status).toBe("running");
+});
+
+it("retains an ambiguous same-name approval until both active tools finish", () => {
+  const state = new SessionMonitorState("claude", "session-one");
+  state.acceptHook(hook("UserPromptSubmit", 1));
+  state.acceptHook(hook("PreToolUse", 2, { toolName: "Bash", toolUseId: "bash-1" }));
+  state.acceptHook(hook("PreToolUse", 3, { toolName: "Bash", toolUseId: "bash-2" }));
+  state.acceptHook(hook("PermissionRequest", 4, { toolName: "Bash" }));
+  state.acceptHook(hook("PostToolUse", 5, { toolName: "Bash", toolUseId: "bash-1" }));
+  expect(state.data.status).toBe("waiting_approval");
+  state.acceptHook(hook("PostToolUse", 6, { toolName: "Bash", toolUseId: "bash-2" }));
+  expect(state.data.status).toBe("running");
+});
+
 it("holds a next-turn Codex approval until that turn is identified by the log", () => {
   const state = new SessionMonitorState("codex", "session-one");
   state.acceptLog(codex("task_started", 1, { turn_id: "old" }));
   state.acceptHook(hook("PermissionRequest", 4, { source: "codex", turnId: "next" }));
   state.acceptLog(codex("task_started", 3, { turn_id: "next" }));
   expect(state.data).toMatchObject({ status: "waiting_approval", turnId: "next", turnStartedAt: timestamp(3) });
+});
+
+function shellApprovalFixture() {
+  const state = new SessionMonitorState("claude", "session-one");
+  state.acceptHook(hook("UserPromptSubmit", 1));
+  state.acceptHook(hook("PreToolUse", 2, { toolName: "Bash", toolUseId: "bash-1" }));
+  state.acceptHook(hook("PermissionRequest", 3, { toolName: "Bash" }));
+  return state;
+}
+
+it("shows a long Bash command as running before PostToolUse when its process has started", () => {
+  const state = shellApprovalFixture();
+  expect(state.data.status).toBe("waiting_approval");
+  expect(state.confirmShellExecution(state.pendingShellApproval()!, timestamp(4))).toBe(true);
+  expect(state.data.status).toBe("running");
+  expect(state.pendingShellApproval()).toBeNull();
+});
+
+it.each([timestamp(2), "invalid"])("does not confirm an old or invalid Bash process start: %s", startedAt => {
+  const state = shellApprovalFixture();
+  expect(state.confirmShellExecution(state.pendingShellApproval()!, startedAt)).toBe(false);
+  expect(state.data.status).toBe("waiting_approval");
+});
+
+it("does not return a completed turn to running when a process observation arrives late", () => {
+  const state = shellApprovalFixture();
+  const approval = state.pendingShellApproval()!;
+  state.acceptHook(hook("Stop", 6));
+  expect(state.confirmShellExecution(approval, timestamp(4))).toBe(false);
+  expect(state.data.status).toBe("idle");
+});
+
+it("does not apply an execution observation after a newer permission request", () => {
+  const state = shellApprovalFixture();
+  const old = state.pendingShellApproval()!;
+  state.acceptHook(hook("PermissionRequest", 5, { toolName: "Bash" }));
+  expect(state.confirmShellExecution(old, timestamp(6))).toBe(false);
+  expect(state.data.status).toBe("waiting_approval");
+});
+
+it("keeps another tool's pending approval when Bash starts", () => {
+  const state = shellApprovalFixture();
+  const bash = state.pendingShellApproval()!;
+  state.acceptHook(hook("PreToolUse", 4, { toolName: "Edit", toolUseId: "edit-1" }));
+  state.acceptHook(hook("PermissionRequest", 5, { toolName: "Edit" }));
+  expect(state.confirmShellExecution(bash, timestamp(4))).toBe(true);
+  expect(state.data.status).toBe("waiting_approval");
+  state.acceptHook(hook("PostToolUse", 6, { toolName: "Edit", toolUseId: "edit-1" }));
+  expect(state.data.status).toBe("running");
+});
+
+it("does not probe or guess execution for simultaneous Bash calls", () => {
+  const state = shellApprovalFixture();
+  state.acceptHook(hook("PreToolUse", 4, { toolName: "Bash", toolUseId: "bash-2" }));
+  expect(state.pendingShellApproval()).toBeNull();
+  expect(state.data.status).toBe("waiting_approval");
 });
 
 it("retains reasoning effort even when a newer hook supplied only the model", () => {

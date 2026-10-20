@@ -9,6 +9,7 @@ import { bootstrapServer } from "../server/index.js";
 import { UsageDatabase } from "../server/db/database.js";
 import { formatTokenCompact } from "../server/utils.js";
 import { detectTerminalWindowSnapshot, type DetectedTerminalWindow } from "./terminal-detector.js";
+import { approveForegroundTerminal } from "./terminal-approval.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const isDev = !app.isPackaged;
@@ -25,6 +26,8 @@ let overlaySyncRunning = false;
 let overlaysPaused = false;
 let lastSummaryTotal = 0;
 const overlayWindows = new Map<string, BrowserWindow>();
+const approvedTerminalPrompts = new Set<string>();
+const pendingTerminalApprovals = new Set<string>();
 const OVERLAY_WIDTH = 208;
 const OVERLAY_HEIGHT = 448;
 const handoffToken = randomUUID();
@@ -429,6 +432,39 @@ function setupIpc() {
       return { ok: true };
     } catch {
       return { ok: false, error: "Windows Terminal could not be started" };
+    }
+  });
+
+  ipcMain.handle("terminal:approve", async (event, request: unknown) => {
+    const overlay = BrowserWindow.fromWebContents(event.sender);
+    if (!overlay || ![...overlayWindows.values()].includes(overlay) || !request || typeof request !== "object") {
+      return { ok: false };
+    }
+
+    const { hwnd, agent, sessionId, turnId } = request as Record<string, unknown>;
+    if (typeof hwnd !== "string" || (agent !== "codex" && agent !== "claude") ||
+      typeof sessionId !== "string" || typeof turnId !== "string") return { ok: false };
+
+    const target = [...overlayWindows.entries()].find(([id, window]) => id === `${hwnd}-${agent}` && window === overlay);
+    if (!target) return { ok: false };
+    const approvalKey = `${hwnd}:${agent}:${sessionId}:${turnId}`;
+    if (approvedTerminalPrompts.has(approvalKey) || pendingTerminalApprovals.has(approvalKey)) return { ok: false };
+
+    const snapshot = await detectTerminalWindowSnapshot();
+    const foreground = snapshot.windows.find(window => window.hwnd === hwnd && window.agent === agent &&
+      !!window.sessionPrefix && sessionId.toLowerCase().startsWith(window.sessionPrefix.toLowerCase()));
+    if (!foreground || snapshot.foregroundHwnd !== hwnd) return { ok: false };
+
+    pendingTerminalApprovals.add(approvalKey);
+    try {
+      const ok = await approveForegroundTerminal(hwnd);
+      if (ok) {
+        approvedTerminalPrompts.add(approvalKey);
+        if (approvedTerminalPrompts.size > 256) approvedTerminalPrompts.delete(approvedTerminalPrompts.values().next().value!);
+      }
+      return { ok };
+    } finally {
+      pendingTerminalApprovals.delete(approvalKey);
     }
   });
 

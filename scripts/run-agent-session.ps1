@@ -84,10 +84,9 @@ if ($agentArguments.Count -gt 0) {
   $startParams.ArgumentList = $agentArguments
 }
 $process = Start-Process @startParams
-$deadline = [DateTime]::UtcNow.AddSeconds(45)
 
 while (-not $process.HasExited) {
-  if (-not $SessionId -and [DateTime]::UtcNow -lt $deadline) {
+  if (-not $SessionId) {
     $newFiles = @(Get-SessionFiles | Where-Object { -not $knownFiles.Contains($_.FullName) })
     if ($newFiles.Count -eq 1) {
       $candidateId = Get-SessionId $newFiles[0]
@@ -98,7 +97,7 @@ while (-not $process.HasExited) {
     }
   }
 
-  Start-Sleep -Milliseconds 150
+  Start-Sleep -Seconds 1
   $process.Refresh()
 }
 
