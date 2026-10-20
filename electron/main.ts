@@ -10,10 +10,16 @@ import { UsageDatabase } from "../server/db/database.js";
 import { formatTokenCompact } from "../server/utils.js";
 import { detectTerminalWindowSnapshot, type DetectedTerminalWindow } from "./terminal-detector.js";
 import { approveForegroundTerminal } from "./terminal-approval.js";
+import { checkTerminalSetup, configureTerminal } from "./terminal-setup.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const isDev = !app.isPackaged;
 const devServerUrl = process.env.VITE_DEV_SERVER_URL;
+const terminalSetupOptions = {
+  sourceDirectory: app.isPackaged ? path.join(process.resourcesPath, "terminal-support") : path.join(app.getAppPath(), "scripts"),
+  installDirectory: path.join(process.env.LOCALAPPDATA ?? app.getPath("userData"), "TokenUsageDashboard", "terminal-support"),
+};
+let terminalSetupPending = false;
 
 let widgetWindow: BrowserWindow | null = null;
 let dashboardWindow: BrowserWindow | null = null;
@@ -282,8 +288,9 @@ async function syncOverlayWindows() {
   }
 }
 
-async function createDashboardWindow() {
+async function createDashboardWindow(openSettings = false) {
   if (dashboardWindow) {
+    dashboardWindow.show();
     dashboardWindow.focus();
     return;
   }
@@ -313,7 +320,7 @@ async function createDashboardWindow() {
     console.error("Dashboard failed to load", { errorCode, errorDescription, validatedUrl });
   });
 
-  await dashboardWindow.loadURL(getRendererTarget("dashboard"));
+  await dashboardWindow.loadURL(getRendererTarget("dashboard") + (openSettings ? "#/settings" : ""));
 }
 
 function updateTrayMenu(summaryTotal = 0) {
@@ -387,6 +394,21 @@ function launchAgentTerminal(agent: AgentKind) {
 }
 
 function setupIpc() {
+  ipcMain.handle("terminal:get-setup", () => checkTerminalSetup(terminalSetupOptions));
+  ipcMain.handle("terminal:configure", async (event) => {
+    if (!dashboardWindow || event.sender !== dashboardWindow.webContents || event.senderFrame !== event.sender.mainFrame || terminalSetupPending) {
+      return { ok: false, error: "請從設定頁操作，並等待目前設定完成。" };
+    }
+    terminalSetupPending = true;
+    try {
+      const result = await configureTerminal(terminalSetupOptions);
+      return { ok: result.status.ready, ...result };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : "Terminal 設定失敗。" };
+    } finally {
+      terminalSetupPending = false;
+    }
+  });
   ipcMain.on("widget:pointer", (event, interactive: unknown) => {
     const win = BrowserWindow.fromWebContents(event.sender);
     if (win && [...overlayWindows.values()].includes(win)) {
@@ -531,6 +553,8 @@ async function main() {
   writeStartupLog("tray ready");
   startOverlayWatcher();
   startQuotaWatcher();
+  const terminalSetup = await checkTerminalSetup(terminalSetupOptions);
+  if (!terminalSetup.ready) await createDashboardWindow(true);
   setInterval(async () => {
     const today = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Taipei" });
     const summary = backend ? backend.db.getSummary(today, today) : null;

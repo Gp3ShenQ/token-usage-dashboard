@@ -58,6 +58,13 @@
       "package.json",
       "!dist-electron/**/__tests__/**"
     ],
+    "extraResources": [
+      {
+        "from": "scripts",
+        "to": "terminal-support",
+        "filter": ["agent-wrappers.ps1", "start-agent-session.ps1", "run-agent-session.ps1"]
+      }
+    ],
     "portable": {
       "artifactName": "token-usage-dashboard-portable.exe"
     },

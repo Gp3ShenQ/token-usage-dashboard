@@ -9,6 +9,8 @@ declare global {
       openDashboard: () => Promise<{ ok: true }>;
       minimizeToTray: () => Promise<{ ok: true }>;
       launchAgentTerminal: (agent: "codex" | "claude") => Promise<{ ok: boolean; error?: string }>;
+      getTerminalSetup: () => Promise<import("../electron/terminal-setup").TerminalSetupStatus>;
+      configureTerminal: () => Promise<{ ok: boolean; error?: string; status?: import("../electron/terminal-setup").TerminalSetupStatus; backupPath?: string | null }>;
       approveTerminal: (request: { hwnd: string; agent: "codex" | "claude"; sessionId: string; turnId: string }) => Promise<{ ok: boolean }>;
       setOverlayAgent: (hwnd: string, agent: "codex" | "claude") => Promise<{ ok: boolean }>;
     };
