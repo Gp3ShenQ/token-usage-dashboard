@@ -9,6 +9,7 @@ declare global {
       openDashboard: () => Promise<{ ok: true }>;
       minimizeToTray: () => Promise<{ ok: true }>;
       launchAgentTerminal: (agent: "codex" | "claude") => Promise<{ ok: boolean; error?: string }>;
+      approveTerminal: (request: { hwnd: string; agent: "codex" | "claude"; sessionId: string; turnId: string }) => Promise<{ ok: boolean }>;
       setOverlayAgent: (hwnd: string, agent: "codex" | "claude") => Promise<{ ok: boolean }>;
     };
   }

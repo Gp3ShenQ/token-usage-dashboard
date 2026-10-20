@@ -12,6 +12,9 @@ const searchParams = new URLSearchParams(window.location.search);
 const currentAgent = ref<AgentKind>(searchParams.get("agent") === "claude" ? "claude" : "codex");
 const isOverlay = searchParams.get("overlay") === "1";
 const sessionPrefix = searchParams.get("session") ?? "";
+const terminalHwnd = searchParams.get("hwnd") ?? "";
+const isMatchingTerminalSession = (sessionId: string) => !!sessionPrefix &&
+  sessionId.toLowerCase().startsWith(sessionPrefix.toLowerCase());
 const directTaskLabel = null;
 
 const fixedOpacity = 0.3;
@@ -59,6 +62,8 @@ const handoffNotice = ref("");
 let handoffTimer: number | null = null;
 let handoffLoading = false;
 let handoffStatusFailed = false;
+let lastApprovedPrompt = "";
+let approvalInProgress = false;
 const HANDOFF_ACTIVE_POLL_MS = 2000;
 const HANDOFF_IDLE_POLL_MS = 30_000;
 const isExactSession = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sessionPrefix);
@@ -156,11 +161,32 @@ function connectMonitor() {
       monitorResult.value = JSON.parse(event.data) as MonitorResult;
       connected.value = true;
       lastMessageAt.value = Date.now();
+      void approveCurrentTerminalPrompt();
     } catch { connected.value = false; }
   };
   stream.onerror = () => { connected.value = false; };
 }
 
+async function approveCurrentTerminalPrompt() {
+  const snapshot = monitorResult.value;
+  if (!isOverlay || !terminalHwnd || snapshot.state !== "ready" || snapshot.data.status !== "waiting_approval" ||
+    snapshot.data.readError || !snapshot.data.turnId || !isMatchingTerminalSession(snapshot.data.sessionId) || !window.tokenHud?.approveTerminal) return;
+
+  const approvalKey = `${snapshot.data.sessionId}:${snapshot.data.turnId}`;
+  if (approvalKey === lastApprovedPrompt || approvalInProgress) return;
+  approvalInProgress = true;
+  try {
+    const result = await window.tokenHud.approveTerminal({
+      hwnd: terminalHwnd,
+      agent: currentAgent.value,
+      sessionId: snapshot.data.sessionId,
+      turnId: snapshot.data.turnId,
+    });
+    if (result.ok) lastApprovedPrompt = approvalKey;
+  } finally {
+    approvalInProgress = false;
+  }
+}
 const panelStyle = computed(() => ({
   "--widget-alpha": `${fixedOpacity}`,
 }));
