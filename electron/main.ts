@@ -467,8 +467,10 @@ function setupIpc() {
     if (typeof hwnd !== "string" || (agent !== "codex" && agent !== "claude") ||
       typeof sessionId !== "string" || typeof turnId !== "string") return { ok: false };
 
-    const target = [...overlayWindows.entries()].find(([id, window]) => id === `${hwnd}-${agent}` && window === overlay);
-    if (!target) return { ok: false };
+    // Overlays are keyed by terminal hwnd; the card must belong to that terminal and agent.
+    // Only the foreground terminal's card is visible, so hidden cards skip the costly window snapshot.
+    if (overlayWindows.get(hwnd) !== overlay || !overlay.isVisible() ||
+      new URL(overlay.webContents.getURL()).searchParams.get("agent") !== agent) return { ok: false };
     const approvalKey = `${hwnd}:${agent}:${sessionId}:${turnId}`;
     if (approvedTerminalPrompts.has(approvalKey) || pendingTerminalApprovals.has(approvalKey)) return { ok: false };
 
