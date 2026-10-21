@@ -8,7 +8,7 @@ import { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, Notification, scr
 import { bootstrapServer } from "../server/index.js";
 import { UsageDatabase } from "../server/db/database.js";
 import { formatTokenCompact } from "../server/utils.js";
-import { detectTerminalWindowSnapshot, type DetectedTerminalWindow } from "./terminal-detector.js";
+import { detectTerminalWindowSnapshot, isAreaCovered, type DetectedTerminalWindow, type TerminalWindowSnapshot } from "./terminal-detector.js";
 import { approveForegroundTerminal } from "./terminal-approval.js";
 import { checkTerminalSetup, configureTerminal } from "./terminal-setup.js";
 
@@ -32,6 +32,8 @@ let overlaySyncRunning = false;
 let overlaysPaused = false;
 let lastSummaryTotal = 0;
 const overlayWindows = new Map<string, BrowserWindow>();
+// One mascot per terminal, kept visible for every terminal that is on screen.
+const mascotWindows = new Map<string, BrowserWindow>();
 const approvedTerminalPrompts = new Set<string>();
 const pendingTerminalApprovals = new Set<string>();
 const OVERLAY_WIDTH = 208;
@@ -41,6 +43,11 @@ const handoffToken = randomUUID();
 const HANDOFF_CLIPBOARD_LIMIT = 512 * 1024;
 const OVERLAY_MARGIN = 12;
 const OVERLAY_TOP_OFFSET = 25;
+const MASCOT_WIDTH = 228;
+const MASCOT_HEIGHT = 56;
+// The scene has its own background, so it can cover the footer text in the bottom-right corner.
+const MASCOT_RIGHT_INSET = 28;
+const MASCOT_BOTTOM_INSET = 14;
 
 type AgentKind = "codex" | "claude";
 
@@ -100,9 +107,8 @@ function restoreWidgetWindow() {
     void createDashboardWindow();
     return;
   }
-  for (const win of overlayWindows.values()) {
-    win.showInactive();
-  }
+  // Sync shows only the foreground terminal's card and the uncovered mascots.
+  void syncOverlayWindows();
   writeStartupLog("restoreWidgetWindow executed", {
     overlayCount: overlayWindows.size,
     widgetVisible: false,
@@ -228,6 +234,94 @@ async function createOverlayWindow(target: DetectedTerminalWindow, shouldShow: b
   return win;
 }
 
+function getMascotBounds(target: DetectedTerminalWindow) {
+  const rawX = target.bounds.x + target.bounds.width - MASCOT_RIGHT_INSET - MASCOT_WIDTH;
+  const rawY = target.bounds.y + target.bounds.height - MASCOT_BOTTOM_INSET - MASCOT_HEIGHT;
+  const { x, y } = clampToDisplay(rawX, rawY, MASCOT_WIDTH, MASCOT_HEIGHT);
+
+  return {
+    x,
+    y,
+    width: MASCOT_WIDTH,
+    height: MASCOT_HEIGHT,
+  };
+}
+
+function getMascotParams(target: DetectedTerminalWindow) {
+  return { view: "mascot", agent: target.agent, session: target.sessionPrefix ?? "" };
+}
+
+async function createMascotWindow(target: DetectedTerminalWindow) {
+  const win = new BrowserWindow({
+    ...getMascotBounds(target),
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: "#00000000",
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    resizable: false,
+    movable: false,
+    focusable: false,
+    hasShadow: false,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.cjs"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      // Mascots chime when Claude stops, without waiting for a click; covered terminals still need to be heard.
+      autoplayPolicy: "no-user-gesture-required",
+      backgroundThrottling: false,
+    },
+  });
+
+  win.setAlwaysOnTop(true, "screen-saver");
+  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  win.setIgnoreMouseEvents(true);
+  win.on("closed", () => {
+    mascotWindows.delete(target.hwnd);
+  });
+
+  await win.loadURL(getRendererTarget("widget", getMascotParams(target)));
+  return win;
+}
+
+// Mascots stay on top, so they are hidden whenever another window covers their spot on the terminal.
+async function syncMascotWindows(snapshot: TerminalWindowSnapshot) {
+  const nextIds = new Set(snapshot.windows.map((target) => target.hwnd));
+  for (const [id, win] of mascotWindows.entries()) {
+    if (nextIds.has(id)) {
+      continue;
+    }
+    mascotWindows.delete(id);
+    win.close();
+  }
+
+  for (const target of snapshot.windows) {
+    const bounds = getMascotBounds(target);
+    const shouldShow = !overlaysPaused && !target.minimized &&
+      !isAreaCovered(bounds, target.zOrder, snapshot.occluders);
+    let win = mascotWindows.get(target.hwnd);
+
+    if (!win) {
+      win = await createMascotWindow(target);
+      mascotWindows.set(target.hwnd, win);
+    } else {
+      win.setBounds(bounds, false);
+      const params = getMascotParams(target);
+      const currentParams = new URL(win.webContents.getURL()).searchParams;
+      if (Object.entries(params).some(([key, value]) => (currentParams.get(key) ?? "") !== value)) {
+        await win.loadURL(getRendererTarget("widget", params));
+      }
+    }
+
+    if (shouldShow) {
+      win.showInactive();
+    } else {
+      win.hide();
+    }
+  }
+}
+
 async function syncOverlayWindows() {
   if (overlaySyncRunning || process.platform !== "win32") {
     return;
@@ -282,6 +376,7 @@ async function syncOverlayWindows() {
       }
     }
 
+    await syncMascotWindows(snapshot);
     updateTrayMenu(lastSummaryTotal);
   } finally {
     overlaySyncRunning = false;
@@ -335,14 +430,11 @@ function updateTrayMenu(summaryTotal = 0) {
         label: overlaysPaused ? "顯示監測卡片" : "隱藏監測卡片",
         click: () => {
           overlaysPaused = !overlaysPaused;
-          for (const win of overlayWindows.values()) {
-            if (overlaysPaused) {
+          if (overlaysPaused) {
+            for (const win of [...overlayWindows.values(), ...mascotWindows.values()]) {
               win.hide();
-            } else {
-              win.showInactive();
             }
-          }
-          if (!overlaysPaused) {
+          } else {
             void syncOverlayWindows();
           }
           updateTrayMenu(summaryTotal);
@@ -583,7 +675,7 @@ app.on("before-quit", async () => {
   if (overlaySyncTimer) {
     clearInterval(overlaySyncTimer);
   }
-  for (const win of overlayWindows.values()) {
+  for (const win of [...overlayWindows.values(), ...mascotWindows.values()]) {
     win.destroy();
   }
   await backend?.close();

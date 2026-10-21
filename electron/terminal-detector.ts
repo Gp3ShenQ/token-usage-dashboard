@@ -17,6 +17,8 @@ export type DetectedTerminalWindow = {
   agent: AgentKind;
   sessionPrefix: string | null;
   taskLabel: string | null;
+  minimized: boolean;
+  zOrder: number;
   bounds: {
     x: number;
     y: number;
@@ -25,9 +27,18 @@ export type DetectedTerminalWindow = {
   };
 };
 
+export type WindowBounds = DetectedTerminalWindow["bounds"];
+
+// Any on-screen top-level window, in z-order (0 is topmost), that can hide part of a terminal.
+export type OccludingWindow = {
+  zOrder: number;
+  bounds: WindowBounds;
+};
+
 export type TerminalWindowSnapshot = {
   foregroundHwnd: string | null;
   windows: DetectedTerminalWindow[];
+  occluders: OccludingWindow[];
 };
 
 type SnapshotWindow = {
@@ -35,17 +46,15 @@ type SnapshotWindow = {
   pid: number;
   title: string;
   processName: string;
-  bounds: {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-  };
+  minimized: boolean;
+  zOrder: number;
+  bounds: WindowBounds;
 };
 
 type Snapshot = {
   foregroundHwnd?: string | null;
   windows: SnapshotWindow[];
+  occluders?: OccludingWindow[];
 };
 
 const SNAPSHOT_SCRIPT = String.raw`
@@ -91,6 +100,15 @@ public static class NativeMethods {
 
   [DllImport("user32.dll")]
   public static extern IntPtr GetForegroundWindow();
+
+  [DllImport("user32.dll")]
+  public static extern bool IsIconic(IntPtr hWnd);
+
+  [DllImport("user32.dll")]
+  public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+  [DllImport("dwmapi.dll")]
+  public static extern int DwmGetWindowAttribute(IntPtr hWnd, int dwAttribute, out int pvAttribute, int cbAttribute);
 }
 "@
 
@@ -103,12 +121,54 @@ Get-CimInstance Win32_Process | ForEach-Object {
 }
 
 $windows = New-Object System.Collections.Generic.List[object]
+$occluders = New-Object System.Collections.Generic.List[object]
+$order = @{ next = 0 }
 
+# EnumWindows walks top-level windows from the top of the z-order down.
 [NativeMethods]::EnumWindows({
   param($hWnd, $lParam)
 
   if (-not [NativeMethods]::IsWindowVisible($hWnd)) {
     return $true
+  }
+
+  # Cloaked windows (other virtual desktops, suspended UWP apps) are not on screen.
+  [int]$cloaked = 0
+  if ([NativeMethods]::DwmGetWindowAttribute($hWnd, 14, [ref]$cloaked, 4) -eq 0 -and $cloaked -ne 0) {
+    return $true
+  }
+
+  $minimized = [NativeMethods]::IsIconic($hWnd)
+  $rect = New-Object NativeMethods+RECT
+  if (-not [NativeMethods]::GetWindowRect($hWnd, [ref]$rect)) {
+    return $true
+  }
+  $width = $rect.Right - $rect.Left
+  $height = $rect.Bottom - $rect.Top
+  if ($width -le 0 -or $height -le 0) {
+    return $true
+  }
+
+  [uint32]$windowPid = 0
+  [void][NativeMethods]::GetWindowThreadProcessId($hWnd, [ref]$windowPid)
+  $windowProcessId = [int]$windowPid
+  # The dashboard's own overlays never hide a terminal from itself.
+  if ($windowProcessId -eq $ownPid) {
+    return $true
+  }
+
+  $zOrder = $order.next
+  $order.next++
+  $bounds = [pscustomobject]@{
+    x = $rect.Left
+    y = $rect.Top
+    width = $width
+    height = $height
+  }
+  # Click-through (WS_EX_TRANSPARENT) windows are see-through overlays, not covers.
+  $exStyle = [NativeMethods]::GetWindowLong($hWnd, -20)
+  if (-not $minimized -and ($exStyle -band 0x20) -eq 0) {
+    $occluders.Add([pscustomobject]@{ zOrder = $zOrder; bounds = $bounds })
   }
 
   $titleLength = [NativeMethods]::GetWindowTextLength($hWnd)
@@ -123,9 +183,6 @@ $windows = New-Object System.Collections.Generic.List[object]
     return $true
   }
 
-  [uint32]$windowPid = 0
-  [void][NativeMethods]::GetWindowThreadProcessId($hWnd, [ref]$windowPid)
-  $windowProcessId = [int]$windowPid
   if (-not $processMap.ContainsKey($windowProcessId)) {
     return $true
   }
@@ -136,13 +193,6 @@ $windows = New-Object System.Collections.Generic.List[object]
     return $true
   }
 
-  $rect = New-Object NativeMethods+RECT
-  if (-not [NativeMethods]::GetWindowRect($hWnd, [ref]$rect)) {
-    return $true
-  }
-
-  $width = $rect.Right - $rect.Left
-  $height = $rect.Bottom - $rect.Top
   if ($width -lt 120 -or $height -lt 80) {
     return $true
   }
@@ -152,12 +202,9 @@ $windows = New-Object System.Collections.Generic.List[object]
     pid = $windowProcessId
     title = $title
     processName = [string]$proc.name
-    bounds = [pscustomobject]@{
-      x = $rect.Left
-      y = $rect.Top
-      width = $width
-      height = $height
-    }
+    minimized = $minimized
+    zOrder = $zOrder
+    bounds = $bounds
   })
 
   return $true
@@ -166,6 +213,7 @@ $windows = New-Object System.Collections.Generic.List[object]
 [pscustomobject]@{
   foregroundHwnd = ([Int64][NativeMethods]::GetForegroundWindow()).ToString()
   windows = $windows
+  occluders = $occluders
 } | ConvertTo-Json -Compress -Depth 6
 `;
 
@@ -214,19 +262,19 @@ function getSessionBinding(agent: AgentKind, tabKey: string): SessionBinding | n
 
 export async function detectTerminalWindowSnapshot(): Promise<TerminalWindowSnapshot> {
   if (process.platform !== "win32") {
-    return { foregroundHwnd: null, windows: [] };
+    return { foregroundHwnd: null, windows: [], occluders: [] };
   }
 
   try {
     const { stdout } = await execFileAsync(
       "powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", SNAPSHOT_SCRIPT],
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", `$ownPid = ${process.pid}\n${SNAPSHOT_SCRIPT}`],
       { timeout: 4000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
     );
 
     const raw = stdout.trim();
     if (!raw) {
-      return { foregroundHwnd: null, windows: [] };
+      return { foregroundHwnd: null, windows: [], occluders: [] };
     }
 
     const snapshot = JSON.parse(raw) as Snapshot;
@@ -234,6 +282,7 @@ export async function detectTerminalWindowSnapshot(): Promise<TerminalWindowSnap
 
     return {
       foregroundHwnd: snapshot.foregroundHwnd ?? null,
+      occluders: snapshot.occluders ?? [],
       windows: windows
       .map((window) => {
         const titleSession = getSessionTitle(window.title);
@@ -258,8 +307,15 @@ export async function detectTerminalWindowSnapshot(): Promise<TerminalWindowSnap
       .filter((item): item is DetectedTerminalWindow => item !== null),
     };
   } catch {
-    return { foregroundHwnd: null, windows: [] };
+    return { foregroundHwnd: null, windows: [], occluders: [] };
   }
+}
+
+// True when any window above `zOrder` overlaps `area`, i.e. part of it would sit over another app.
+export function isAreaCovered(area: WindowBounds, zOrder: number, occluders: OccludingWindow[]) {
+  return occluders.some(({ zOrder: above, bounds }) => above < zOrder &&
+    bounds.x < area.x + area.width && area.x < bounds.x + bounds.width &&
+    bounds.y < area.y + area.height && area.y < bounds.y + bounds.height);
 }
 
 export async function detectTerminalWindows(): Promise<DetectedTerminalWindow[]> {
